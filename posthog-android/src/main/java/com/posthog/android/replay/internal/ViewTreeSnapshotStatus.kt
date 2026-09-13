@@ -13,6 +13,10 @@ internal class ViewTreeSnapshotStatus(
     var keyboardVisible: Boolean = false,
     var lastSnapshot: RRWireframe? = null,
     val drawState: WindowDrawState = WindowDrawState(),
+    // GAME-1236 / posthog-android#752: monotonically increasing order in which this
+    // decor view was registered, so the composite wireframe scene can stack the
+    // active windows deterministically bottom-to-top (Activity first, dialogs on top).
+    var addSequence: Long = 0,
 )
 
 internal data class MaskCaptureToken(

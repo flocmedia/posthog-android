@@ -107,6 +107,7 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 public class PostHogReplayIntegration(
     private val context: Context,
@@ -119,6 +120,26 @@ public class PostHogReplayIntegration(
     // and iteration must hold the map's monitor.
     internal val decorViews: MutableMap<View, ViewTreeSnapshotStatus> =
         Collections.synchronizedMap(WeakHashMap<View, ViewTreeSnapshotStatus>())
+
+    // GAME-1236 / posthog-android#752 — composite wireframe scene (wireframe mode only).
+    //
+    // posthog-android snapshots every Android decor view (Activity, dialogs, popups,
+    // transient windows) independently but ships them all under one $window_id, and the
+    // web player keeps ONE rrweb document per $window_id — a full snapshot resets it. So a
+    // secondary window's full snapshot replaces the Activity's document and every later
+    // Activity mutation orphans (the editor renders white). The invariant #752 requires is
+    // "one $window_id = one internally consistent document history". We satisfy it by making
+    // every full snapshot a COMPOSITE of all currently-active decor roots (ordered by
+    // addSequence, bottom-to-top), instead of one decor view's tree. A new/removed window
+    // changes the topology and re-emits the whole scene; a stable topology emits per-view
+    // incrementals, whose nodes all exist in the composite document.
+    private val sceneLock = Any()
+    private val decorAddCounter = AtomicLong(0)
+
+    // The three scene fields below are only read/written while holding sceneLock.
+    private var sceneSentFullSnapshot: Boolean = false
+    private var sceneMetaSent: Boolean = false
+    private var sceneTopology: List<Long> = emptyList()
 
     private val passwordInputTypes =
         setOf(
@@ -354,6 +375,8 @@ public class PostHogReplayIntegration(
                                 decorView.viewTreeObserver?.addOnGlobalLayoutListener(layoutListener)
 
                                 val status = ViewTreeSnapshotStatus(listener, layoutListener, drawState = drawState)
+                                // Bottom-to-top stacking order for the composite scene (#752).
+                                status.addSequence = decorAddCounter.incrementAndGet()
                                 decorViews[decorView] = status
                             } catch (e: Throwable) {
                                 config.logger.log("Session Replay onDecorViewReady failed: $e.")
@@ -711,6 +734,37 @@ public class PostHogReplayIntegration(
         }?.toRGBColor()
     }
 
+    // Diff a decor view's previous wireframe against its current one and package the
+    // node adds/removes/updates as an incremental snapshot, or null if nothing changed.
+    // Extracted so both the screenshot path and the composite-scene path share it.
+    private fun buildIncrementalSnapshot(
+        last: RRWireframe?,
+        current: RRWireframe,
+        timestamp: Long,
+    ): RRIncrementalSnapshotEvent? {
+        val lastSnapshots = if (last != null) listOf(last) else emptyList()
+        val (addedItems, removedItems, updatedItems) =
+            findAddedAndRemovedItems(
+                lastSnapshots.flattenChildren(),
+                listOf(current).flattenChildren(),
+            )
+        val addedNodes = addedItems.map { RRMutatedNode(it, parentId = it.parentId) }
+        val removedNodes = removedItems.map { RRRemovedNode(it.id, parentId = it.parentId) }
+        val updatedNodes = updatedItems.map { RRMutatedNode(it, parentId = it.parentId) }
+        if (addedNodes.isEmpty() && removedNodes.isEmpty() && updatedNodes.isEmpty()) {
+            return null
+        }
+        return RRIncrementalSnapshotEvent(
+            mutationData =
+                RRIncrementalMutationData(
+                    adds = addedNodes.ifEmpty { null },
+                    removes = removedNodes.ifEmpty { null },
+                    updates = updatedNodes.ifEmpty { null },
+                ),
+            timestamp = timestamp,
+        )
+    }
+
     // internal (not private) so tests can drive a snapshot pass directly.
     // Returns whether a frame was actually produced (false on every early bail),
     // so the bridge caller can tell "captured" from "silently skipped".
@@ -752,7 +806,16 @@ public class PostHogReplayIntegration(
 
         val events = mutableListOf<RREvent>()
 
-        if (!status.sentMetaEvent) {
+        // In wireframe mode the whole scene is one shared document, so the Meta
+        // (viewport/href) is emitted once at scene level, from whichever decor view
+        // snapshots first (the Activity). Screenshot mode keeps its per-view Meta.
+        val needMeta =
+            if (useScreenshot) {
+                !status.sentMetaEvent
+            } else {
+                synchronized(sceneLock) { !sceneMetaSent }
+            }
+        if (needMeta) {
             val title = view.phoneWindow?.attributes?.title?.toString()?.substringAfter("/") ?: ""
             // TODO: cache and compare, if size changes, we send a ViewportResize event
 
@@ -766,60 +829,70 @@ public class PostHogReplayIntegration(
                     timestamp = timestamp,
                 )
             events.add(metaEvent)
-            status.sentMetaEvent = true
+            if (useScreenshot) {
+                status.sentMetaEvent = true
+            } else {
+                synchronized(sceneLock) { sceneMetaSent = true }
+            }
         }
 
-        if (!status.sentFullSnapshot) {
-            val event =
-                RRFullSnapshotEvent(
-                    listOf(wireframe),
-                    initialOffsetTop = 0,
-                    initialOffsetLeft = 0,
-                    timestamp = timestamp,
-                )
-            events.add(event)
-            status.sentFullSnapshot = true
-        } else {
-            val lastSnapshot = status.lastSnapshot
-            val lastSnapshots = if (lastSnapshot != null) listOf(lastSnapshot) else emptyList()
-            val (addedItems, removedItems, updatedItems) =
-                findAddedAndRemovedItems(
-                    lastSnapshots.flattenChildren(),
-                    listOf(wireframe).flattenChildren(),
-                )
-
-            val addedNodes = mutableListOf<RRMutatedNode>()
-            addedItems.forEach {
-                val item = RRMutatedNode(it, parentId = it.parentId)
-                addedNodes.add(item)
-            }
-
-            val removedNodes = mutableListOf<RRRemovedNode>()
-            removedItems.forEach {
-                val item = RRRemovedNode(it.id, parentId = it.parentId)
-                removedNodes.add(item)
-            }
-
-            val updatedNodes = mutableListOf<RRMutatedNode>()
-            updatedItems.forEach {
-                val item = RRMutatedNode(it, parentId = it.parentId)
-                updatedNodes.add(item)
-            }
-
-            if (addedNodes.isNotEmpty() || removedNodes.isNotEmpty() || updatedNodes.isNotEmpty()) {
-                val incrementalMutationData =
-                    RRIncrementalMutationData(
-                        adds = addedNodes.ifEmpty { null },
-                        removes = removedNodes.ifEmpty { null },
-                        updates = updatedNodes.ifEmpty { null },
-                    )
-
-                val incrementalSnapshotEvent =
-                    RRIncrementalSnapshotEvent(
-                        mutationData = incrementalMutationData,
+        if (useScreenshot) {
+            // Screenshot mode: unchanged per-view behavior. Each snapshot is a
+            // full-screen bitmap, so there is no cross-window document to stomp.
+            if (!status.sentFullSnapshot) {
+                events.add(
+                    RRFullSnapshotEvent(
+                        listOf(wireframe),
+                        initialOffsetTop = 0,
+                        initialOffsetLeft = 0,
                         timestamp = timestamp,
-                    )
-                events.add(incrementalSnapshotEvent)
+                    ),
+                )
+                status.sentFullSnapshot = true
+            } else {
+                buildIncrementalSnapshot(status.lastSnapshot, wireframe, timestamp)?.let {
+                    events.add(it)
+                }
+            }
+        } else {
+            // Wireframe mode: composite scene (GAME-1236 / posthog-android#752).
+            // Cache this view's fresh wireframe first so the composite/incremental sees it.
+            val prevLastSnapshot = status.lastSnapshot
+            status.lastSnapshot = wireframe
+
+            val compositeFull: RREvent? =
+                synchronized(sceneLock) {
+                    // All active decor roots that have a wireframe (this one is fresh),
+                    // ordered bottom-to-top by registration order.
+                    val active =
+                        synchronized(decorViews) { decorViews.values.toList() }
+                            .filter { it === status || it.lastSnapshot != null }
+                            .sortedBy { it.addSequence }
+                    val topology = active.map { it.addSequence }
+                    // A new/removed/reordered window (or the first full ever) re-emits the
+                    // whole scene as ONE full snapshot; a stable topology falls through to a
+                    // per-view incremental whose nodes all exist in the composite document.
+                    if (!sceneSentFullSnapshot || topology != sceneTopology) {
+                        sceneSentFullSnapshot = true
+                        sceneTopology = topology
+                        active.forEach { it.sentFullSnapshot = true }
+                        RRFullSnapshotEvent(
+                            active.mapNotNull { it.lastSnapshot },
+                            initialOffsetTop = 0,
+                            initialOffsetLeft = 0,
+                            timestamp = timestamp,
+                        )
+                    } else {
+                        null
+                    }
+                }
+
+            if (compositeFull != null) {
+                events.add(compositeFull)
+            } else {
+                buildIncrementalSnapshot(prevLastSnapshot, wireframe, timestamp)?.let {
+                    events.add(it)
+                }
             }
         }
 
@@ -2124,6 +2197,12 @@ public class PostHogReplayIntegration(
             decorViews.entries.forEach {
                 resetViewSnapshotStates(it.value)
             }
+        }
+        // Reset the composite-scene state too, so a new session re-emits a full scene.
+        synchronized(sceneLock) {
+            sceneSentFullSnapshot = false
+            sceneMetaSent = false
+            sceneTopology = emptyList()
         }
     }
 
