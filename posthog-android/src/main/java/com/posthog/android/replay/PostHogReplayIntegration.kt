@@ -734,6 +734,14 @@ public class PostHogReplayIntegration(
         }?.toRGBColor()
     }
 
+    // Total number of wireframe nodes in a subtree (the root plus all descendants).
+    // Used to tell a real content window from a lone-image overlay (GAME-1236 / #752).
+    private fun subtreeNodeCount(wireframe: RRWireframe): Int {
+        var count = 1
+        wireframe.childWireframes?.forEach { count += subtreeNodeCount(it) }
+        return count
+    }
+
     // Diff a decor view's previous wireframe against its current one and package the
     // node adds/removes/updates as an incremental snapshot, or null if nothing changed.
     // Extracted so both the screenshot path and the composite-scene path share it.
@@ -810,14 +818,18 @@ public class PostHogReplayIntegration(
         // contains its stickers/text/in-layout dialogs, so dropping the overlays loses no
         // content and makes the stomp structurally impossible. Screenshot mode is unaffected.
         if (!useScreenshot) {
-            // Absolute dp floor rather than a screen-relative ratio: screenSize() is
-            // unreliable for popup/overlay window contexts (it can return null, or the
-            // popup's own tiny size), which let the stompers slip through. Wireframe
-            // dimensions are in dp; every real content screen here is ~392x850dp, while
-            // the selection/drag overlays are 32-64dp — so a generous floor cleanly
-            // separates them with no dependency on measuring the display.
-            if (wireframe.width < MIN_CONTENT_WINDOW_DP || wireframe.height < MIN_CONTENT_WINDOW_HEIGHT_DP) {
-                android.util.Log.i("RWSF", "SKIP overlay window ${wireframe.width}x${wireframe.height}")
+            // Skip lone-image overlay windows by NODE COUNT, not size. The editor library
+            // renders the selected/dragged sticker in its own decor view — sometimes a tiny
+            // popup, sometimes a FULL-SCREEN drag layer holding just the one sticker image —
+            // and every decor view is snapshotted under the shared $window_id, so that lone
+            // image resets the single web-player document to white + one sticker. Size can't
+            // tell a full-screen drag layer from the real editor; node count can: a real
+            // screen here has 20-250 wireframe nodes, a lone-image overlay (or a stripped
+            // system-bar root) has ~1. Measured across production exports: stompers = 1 node,
+            // every content window >= 22.
+            val nodeCount = subtreeNodeCount(wireframe)
+            if (nodeCount < MIN_CONTENT_WINDOW_NODES) {
+                android.util.Log.i("RWSF", "SKIP overlay window ${wireframe.width}x${wireframe.height} nodes=$nodeCount")
                 return false
             }
         }
@@ -2670,13 +2682,11 @@ public class PostHogReplayIntegration(
 
         private val integrationInstalled = AtomicBoolean(false)
 
-        // GAME-1236 / posthog-android#752 — the minimum wireframe size (dp) a decor view
-        // must have to be captured in wireframe mode. Real content screens are hundreds
-        // of dp in both dimensions; the editor library's selection/drag overlay windows
-        // are only tens of dp and, captured as separate documents under the shared
-        // $window_id, white out the editor. These floors sit well above the overlays and
-        // well below any full screen.
-        private const val MIN_CONTENT_WINDOW_DP: Int = 200
-        private const val MIN_CONTENT_WINDOW_HEIGHT_DP: Int = 300
+        // GAME-1236 / posthog-android#752 — the minimum wireframe node count a decor view
+        // must have to be captured in wireframe mode. A real content screen has 20-250
+        // nodes; the editor library's lone-image selection/drag overlays (and stripped
+        // system-bar roots) have ~1. This floor sits well above the overlays and well below
+        // any real screen, and unlike a size threshold it catches a full-screen drag layer.
+        private const val MIN_CONTENT_WINDOW_NODES: Int = 12
     }
 }
