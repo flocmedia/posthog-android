@@ -838,7 +838,6 @@ public class PostHogReplayIntegration(
             // 27-250 nodes; every stomper is a non-full-screen or ~1-node window.
             val nodeCount = subtreeNodeCount(wireframe)
             if (wireframe.height < MIN_FULLSCREEN_HEIGHT_DP || nodeCount < MIN_CONTENT_WINDOW_NODES) {
-                android.util.Log.i("RWSF", "SKIP window ${wireframe.width}x${wireframe.height} nodes=$nodeCount")
                 return false
             }
         }
