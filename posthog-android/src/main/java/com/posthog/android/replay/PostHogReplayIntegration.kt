@@ -107,7 +107,6 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 public class PostHogReplayIntegration(
     private val context: Context,
@@ -121,25 +120,17 @@ public class PostHogReplayIntegration(
     internal val decorViews: MutableMap<View, ViewTreeSnapshotStatus> =
         Collections.synchronizedMap(WeakHashMap<View, ViewTreeSnapshotStatus>())
 
-    // GAME-1236 / posthog-android#752 — composite wireframe scene (wireframe mode only).
+    // GAME-1236 / posthog-android#752 — single-root wireframe documents (wireframe mode only).
     //
-    // posthog-android snapshots every Android decor view (Activity, dialogs, popups,
-    // transient windows) independently but ships them all under one $window_id, and the
-    // web player keeps ONE rrweb document per $window_id — a full snapshot resets it. So a
-    // secondary window's full snapshot replaces the Activity's document and every later
-    // Activity mutation orphans (the editor renders white). The invariant #752 requires is
-    // "one $window_id = one internally consistent document history". We satisfy it by making
-    // every full snapshot a COMPOSITE of all currently-active decor roots (ordered by
-    // addSequence, bottom-to-top), instead of one decor view's tree. A new/removed window
-    // changes the topology and re-emits the whole scene; a stable topology emits per-view
-    // incrementals, whose nodes all exist in the composite document.
-    private val sceneLock = Any()
-    private val decorAddCounter = AtomicLong(0)
-
-    // The three scene fields below are only read/written while holding sceneLock.
-    private var sceneSentFullSnapshot: Boolean = false
-    private var sceneMetaSent: Boolean = false
-    private var sceneTopology: List<Long> = emptyList()
+    // posthog-android snapshots every Android decor view (Activity, dialogs, popups, the editor
+    // library's selection/drag overlays) independently but ships them all under one $window_id,
+    // and the web player keeps ONE rrweb document per $window_id — a full snapshot resets it. So
+    // a secondary window's full snapshot replaces the Activity's document and every later
+    // Activity mutation orphans: the screen renders white. We satisfy the #752 invariant ("one
+    // $window_id = one internally consistent document") by capturing ONLY full-screen, content-
+    // rich windows (see the guard in generateSnapshot) and emitting each as a single-root
+    // document. Dialogs and lone-image overlays are dropped, so no secondary window can stomp,
+    // and there is never a multi-root full snapshot (which the player renders inconsistently).
 
     private val passwordInputTypes =
         setOf(
@@ -375,8 +366,6 @@ public class PostHogReplayIntegration(
                                 decorView.viewTreeObserver?.addOnGlobalLayoutListener(layoutListener)
 
                                 val status = ViewTreeSnapshotStatus(listener, layoutListener, drawState = drawState)
-                                // Bottom-to-top stacking order for the composite scene (#752).
-                                status.addSequence = decorAddCounter.incrementAndGet()
                                 decorViews[decorView] = status
                             } catch (e: Throwable) {
                                 config.logger.log("Session Replay onDecorViewReady failed: $e.")
@@ -818,18 +807,22 @@ public class PostHogReplayIntegration(
         // contains its stickers/text/in-layout dialogs, so dropping the overlays loses no
         // content and makes the stomp structurally impossible. Screenshot mode is unaffected.
         if (!useScreenshot) {
-            // Skip lone-image overlay windows by NODE COUNT, not size. The editor library
-            // renders the selected/dragged sticker in its own decor view — sometimes a tiny
-            // popup, sometimes a FULL-SCREEN drag layer holding just the one sticker image —
-            // and every decor view is snapshotted under the shared $window_id, so that lone
-            // image resets the single web-player document to white + one sticker. Size can't
-            // tell a full-screen drag layer from the real editor; node count can: a real
-            // screen here has 20-250 wireframe nodes, a lone-image overlay (or a stripped
-            // system-bar root) has ~1. Measured across production exports: stompers = 1 node,
-            // every content window >= 22.
+            // Capture ONLY full-screen, content-rich windows (GAME-1236 / posthog-android#752).
+            // Every Android decor view is snapshotted under the shared $window_id and the web
+            // player keeps one document per id, so any secondary window's full snapshot resets
+            // that document and whites out the screen. The foreground content screens here (the
+            // editor, the "Continue where you left off" landing, the share screen) fill the
+            // display and carry dozens of wireframe nodes; the things that stomp do not:
+            //   - the editor library's lone-image selection/drag overlays: ~1 node (any size),
+            //   - modal dialogs (the restore prompt 373x213, the "Loading…" popups 373x21x): short.
+            // Height separates a full-screen Activity (>=~700dp) from a floating dialog, and node
+            // count separates it from a lone-image overlay. Real dialogs in this app render
+            // in-layout (part of the Activity window), so dropping the separate ones loses no
+            // content. Measured across production exports: every content screen is 392x850 with
+            // 27-250 nodes; every stomper is a non-full-screen or ~1-node window.
             val nodeCount = subtreeNodeCount(wireframe)
-            if (nodeCount < MIN_CONTENT_WINDOW_NODES) {
-                android.util.Log.i("RWSF", "SKIP overlay window ${wireframe.width}x${wireframe.height} nodes=$nodeCount")
+            if (wireframe.height < MIN_FULLSCREEN_HEIGHT_DP || nodeCount < MIN_CONTENT_WINDOW_NODES) {
+                android.util.Log.i("RWSF", "SKIP window ${wireframe.width}x${wireframe.height} nodes=$nodeCount")
                 return false
             }
         }
@@ -844,16 +837,9 @@ public class PostHogReplayIntegration(
 
         val events = mutableListOf<RREvent>()
 
-        // In wireframe mode the whole scene is one shared document, so the Meta
-        // (viewport/href) is emitted once at scene level, from whichever decor view
-        // snapshots first (the Activity). Screenshot mode keeps its per-view Meta.
-        val needMeta =
-            if (useScreenshot) {
-                !status.sentMetaEvent
-            } else {
-                synchronized(sceneLock) { !sceneMetaSent }
-            }
-        if (needMeta) {
+        // Per-view Meta (viewport/href): each captured full-screen window sends its own
+        // before its first full snapshot, matching the single-root document it produces.
+        if (!status.sentMetaEvent) {
             val title = view.phoneWindow?.attributes?.title?.toString()?.substringAfter("/") ?: ""
             // TODO: cache and compare, if size changes, we send a ViewportResize event
 
@@ -867,11 +853,7 @@ public class PostHogReplayIntegration(
                     timestamp = timestamp,
                 )
             events.add(metaEvent)
-            if (useScreenshot) {
-                status.sentMetaEvent = true
-            } else {
-                synchronized(sceneLock) { sceneMetaSent = true }
-            }
+            status.sentMetaEvent = true
         }
 
         if (useScreenshot) {
@@ -893,40 +875,25 @@ public class PostHogReplayIntegration(
                 }
             }
         } else {
-            // Wireframe mode: composite scene (GAME-1236 / posthog-android#752).
-            // Cache this view's fresh wireframe first so the composite/incremental sees it.
+            // Wireframe mode (GAME-1236 / posthog-android#752): SINGLE-ROOT documents only.
+            // Only full-screen content windows reach here (the guard above dropped dialogs and
+            // lone-image overlays), so each is emitted as its own single-root full/incremental
+            // — never a multi-root composite, which the web player renders inconsistently (it
+            // keys off the first root, so a second window can hide the screen). A full-screen
+            // Activity replacing another (editor -> landing -> share) is a normal single-root
+            // document swap the player handles cleanly; nothing left can stomp the screen white.
             val prevLastSnapshot = status.lastSnapshot
             status.lastSnapshot = wireframe
-
-            val compositeFull: RREvent? =
-                synchronized(sceneLock) {
-                    // All active decor roots that have a wireframe (this one is fresh),
-                    // ordered bottom-to-top by registration order.
-                    val active =
-                        synchronized(decorViews) { decorViews.values.toList() }
-                            .filter { it === status || it.lastSnapshot != null }
-                            .sortedBy { it.addSequence }
-                    val topology = active.map { it.addSequence }
-                    // A new/removed/reordered window (or the first full ever) re-emits the
-                    // whole scene as ONE full snapshot; a stable topology falls through to a
-                    // per-view incremental whose nodes all exist in the composite document.
-                    if (!sceneSentFullSnapshot || topology != sceneTopology) {
-                        sceneSentFullSnapshot = true
-                        sceneTopology = topology
-                        active.forEach { it.sentFullSnapshot = true }
-                        RRFullSnapshotEvent(
-                            active.mapNotNull { it.lastSnapshot },
-                            initialOffsetTop = 0,
-                            initialOffsetLeft = 0,
-                            timestamp = timestamp,
-                        )
-                    } else {
-                        null
-                    }
-                }
-
-            if (compositeFull != null) {
-                events.add(compositeFull)
+            if (!status.sentFullSnapshot) {
+                events.add(
+                    RRFullSnapshotEvent(
+                        listOf(wireframe),
+                        initialOffsetTop = 0,
+                        initialOffsetLeft = 0,
+                        timestamp = timestamp,
+                    ),
+                )
+                status.sentFullSnapshot = true
             } else {
                 buildIncrementalSnapshot(prevLastSnapshot, wireframe, timestamp)?.let {
                     events.add(it)
@@ -2236,12 +2203,6 @@ public class PostHogReplayIntegration(
                 resetViewSnapshotStates(it.value)
             }
         }
-        // Reset the composite-scene state too, so a new session re-emits a full scene.
-        synchronized(sceneLock) {
-            sceneSentFullSnapshot = false
-            sceneMetaSent = false
-            sceneTopology = emptyList()
-        }
     }
 
     override fun stop() {
@@ -2688,5 +2649,11 @@ public class PostHogReplayIntegration(
         // system-bar roots) have ~1. This floor sits well above the overlays and well below
         // any real screen, and unlike a size threshold it catches a full-screen drag layer.
         private const val MIN_CONTENT_WINDOW_NODES: Int = 12
+
+        // Minimum wireframe height (dp) for a decor view to count as a full-screen content
+        // window. Content screens here are ~850dp tall; modal dialogs are <=~280dp, so this
+        // floor drops floating dialogs while leaving every real screen (and the ~777dp system
+        // share sheet) captured.
+        private const val MIN_FULLSCREEN_HEIGHT_DP: Int = 500
     }
 }
