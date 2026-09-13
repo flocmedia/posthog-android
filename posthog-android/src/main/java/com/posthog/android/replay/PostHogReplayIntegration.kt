@@ -995,7 +995,10 @@ public class PostHogReplayIntegration(
      * vs delayed-screenshot-walk race test).
      */
     private fun View.hasGlobalVisibleRect(walk: MaskWalk? = null): Boolean {
-        return if (isViewStateStableForMatrixOperations()) {
+        // GAME-1236: geometry-readable, not the strict matrix-stable gate, so a view that is merely
+        // animating or being dragged (a sticker mid-gesture) is not treated as invisible and dropped
+        // from the wireframe. getGlobalVisibleRect returns its current on-screen rect regardless.
+        return if (isViewGeometryReadable()) {
             if (walk != null) {
                 getGlobalVisibleRect(walk.scratchRect, walk.scratchPoint)
             } else {
@@ -1025,6 +1028,31 @@ public class PostHogReplayIntegration(
         } catch (e: Throwable) {
             // If any check fails, assume unstable state
             config.logger.log("Session Replay view state check failed: $e.")
+            false
+        }
+    }
+
+    // GAME-1236: geometry-readable is a deliberately WEAKER gate than
+    // isViewStateStableForMatrixOperations, for the wireframe visibility + coordinate path ONLY
+    // (never the mask path, which must stay strict so a mid-transform frame can't leak pixels).
+    //
+    // The strict gate rejects a view that merely has transient state or a running animation, and
+    // callers then DROP the view (isVisible -> null) or fall its coordinates back to (0,0). That is
+    // exactly what a sticker being dragged has: the editor moves each sticker with a matrix
+    // transform, so mid-gesture it is "transient", vanishes from every wireframe, and the replay
+    // shows it frozen at the last settled position. But a view that is animating or being dragged is
+    // still at a valid, readable position — getLocationOnScreen returns its current transformed
+    // location — so it should stay captured and track its motion. Only a real layout pass
+    // (isInLayout / isComputingLayout) or an unlaid-out/detached view makes the geometry
+    // genuinely untrustworthy, so those are the only conditions kept here.
+    private fun View.isViewGeometryReadable(): Boolean {
+        return try {
+            isAttachedToWindow &&
+                (isLaidOut || PostHogSessionManager.isReactNative) &&
+                width > 0 && height > 0 &&
+                !isInLayout &&
+                !isComputingLayout()
+        } catch (e: Throwable) {
             false
         }
     }
@@ -1530,7 +1558,11 @@ public class PostHogReplayIntegration(
         val viewId = System.identityHashCode(view)
 
         val coordinates = IntArray(2)
-        if (view.isViewStateStableForMatrixOperations()) {
+        if (view.isViewGeometryReadable()) {
+            // GAME-1236: geometry-readable (tolerates animation/gesture transient state) rather than
+            // the strict matrix-stable gate, so a sticker being dragged is captured at its CURRENT
+            // transformed position and its motion shows in the replay instead of freezing. The (0,0)
+            // fallback below now only applies to a genuinely unreadable view (mid-layout/detached).
             view.getLocationOnScreen(coordinates)
         } else {
             // Use zero coordinates as fallback when view state is unstable
@@ -1677,7 +1709,11 @@ public class PostHogReplayIntegration(
         val viewId = System.identityHashCode(view)
 
         val coordinates = IntArray(2)
-        if (view.isViewStateStableForMatrixOperations()) {
+        if (view.isViewGeometryReadable()) {
+            // GAME-1236: geometry-readable (tolerates animation/gesture transient state) rather than
+            // the strict matrix-stable gate, so a sticker being dragged is captured at its CURRENT
+            // transformed position and its motion shows in the replay instead of freezing. The (0,0)
+            // fallback below now only applies to a genuinely unreadable view (mid-layout/detached).
             view.getLocationOnScreen(coordinates)
         } else {
             // Use zero coordinates as fallback when view state is unstable
