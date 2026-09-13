@@ -786,6 +786,24 @@ public class PostHogReplayIntegration(
         val timestamp = config.dateProvider.currentTimeMillis()
 
         val useScreenshot = config.sessionReplayConfig.screenshot || forceScreenshot
+
+        // GAME-1236 / posthog-android#752 — in wireframe mode, capture ONLY the primary
+        // application (Activity) window. Every Android decor view (dialogs, popups, the
+        // selection/sticker overlays this app's editor library shows) is snapshotted
+        // independently but shipped under one shared $window_id; the web player keeps one
+        // document per $window_id, so a lone secondary FULL snapshot (e.g. a 32x32 icon or
+        // a 64x64 selected-sticker overlay) resets that document and orphans the editor —
+        // the replay goes white with a single image on it. The editor Activity already
+        // contains its stickers/text/in-layout dialogs, so skipping the separate overlay
+        // windows loses no editor content while making the stomp structurally impossible
+        // (only single, coherent Activity documents are ever produced). Screenshot mode is
+        // unaffected — each snapshot there is a full-screen bitmap with nothing to stomp.
+        if (!useScreenshot) {
+            val windowType = (view.layoutParams as? WindowManager.LayoutParams)?.type
+            if (windowType != WindowManager.LayoutParams.TYPE_BASE_APPLICATION) {
+                return false
+            }
+        }
         val wireframe =
             if (useScreenshot) {
                 view.toScreenshotWireframe(
