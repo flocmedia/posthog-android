@@ -787,23 +787,6 @@ public class PostHogReplayIntegration(
 
         val useScreenshot = config.sessionReplayConfig.screenshot || forceScreenshot
 
-        // GAME-1236 / posthog-android#752 — in wireframe mode, capture ONLY the primary
-        // application (Activity) window. Every Android decor view (dialogs, popups, the
-        // selection/sticker overlays this app's editor library shows) is snapshotted
-        // independently but shipped under one shared $window_id; the web player keeps one
-        // document per $window_id, so a lone secondary FULL snapshot (e.g. a 32x32 icon or
-        // a 64x64 selected-sticker overlay) resets that document and orphans the editor —
-        // the replay goes white with a single image on it. The editor Activity already
-        // contains its stickers/text/in-layout dialogs, so skipping the separate overlay
-        // windows loses no editor content while making the stomp structurally impossible
-        // (only single, coherent Activity documents are ever produced). Screenshot mode is
-        // unaffected — each snapshot there is a full-screen bitmap with nothing to stomp.
-        if (!useScreenshot) {
-            val windowType = (view.layoutParams as? WindowManager.LayoutParams)?.type
-            if (windowType != WindowManager.LayoutParams.TYPE_BASE_APPLICATION) {
-                return false
-            }
-        }
         val wireframe =
             if (useScreenshot) {
                 view.toScreenshotWireframe(
@@ -813,6 +796,27 @@ public class PostHogReplayIntegration(
             } else {
                 view.toWireframe() ?: return false
             }
+
+        // GAME-1236 / posthog-android#752 — in wireframe mode, only capture (near-)full-screen
+        // content windows. This app's editor library renders the selected sticker / drag
+        // handles in tiny separate decor views (a 32x32 / 56x56 single-image window), and
+        // every decor view is snapshotted independently but shipped under one shared
+        // $window_id. The web player keeps one document per $window_id, so a lone secondary
+        // FULL snapshot (that single image) resets the document and whites out the editor,
+        // with the image sitting on the blank screen. Those overlays are TYPE_BASE_APPLICATION
+        // just like the editor, so window type cannot tell them apart — but they are far
+        // smaller than the screen while the real content windows (the editor, the landing
+        // "Continue where you left off" screen, the share screen) fill it. The editor already
+        // contains its stickers/text/in-layout dialogs, so dropping the overlays loses no
+        // content and makes the stomp structurally impossible. Screenshot mode is unaffected.
+        if (!useScreenshot) {
+            val screen = view.context.screenSize()
+            if (screen != null &&
+                (wireframe.width < screen.width * 4 / 5 || wireframe.height < screen.height * 7 / 10)
+            ) {
+                return false
+            }
+        }
 
         // if the decorView has no backgroundColor, we use the theme color
         // no need to do this if we are capturing a screenshot
