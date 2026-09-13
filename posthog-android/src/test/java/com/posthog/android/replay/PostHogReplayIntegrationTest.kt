@@ -106,6 +106,9 @@ internal class PostHogReplayIntegrationTest {
 
         override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
         }
+
+        override fun onBufferCleared() {
+        }
     }
 
     private class RecordingLogger : PostHogLogger {

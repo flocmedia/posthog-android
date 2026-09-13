@@ -65,11 +65,16 @@ internal class PostHogReplayQueueTest {
         override var isBuffering: Boolean = false
         override var isActive: Boolean = true
         var didBufferSnapshotCallCount: Int = 0
+        var bufferClearedCallCount: Int = 0
         var lastReplayQueue: PostHogReplayQueue? = null
 
         override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
             didBufferSnapshotCallCount++
             lastReplayQueue = replayQueue
+        }
+
+        override fun onBufferCleared() {
+            bufferClearedCallCount++
         }
     }
 
@@ -403,6 +408,8 @@ internal class PostHogReplayQueueTest {
                         }
                     }
                 }
+
+                override fun onBufferCleared() {}
             }
         queue.bufferDelegate = delegate
 
@@ -441,6 +448,28 @@ internal class PostHogReplayQueueTest {
         awaitReplayExecutors()
 
         assertEquals(0, queue.bufferDepth)
+    }
+
+    @Test
+    fun `clearBuffer notifies delegate so it can re-anchor snapshot state`() {
+        // GAME-1236: a buffer drop discards any buffered FULL snapshot, but the per-view snapshot
+        // state that decides full-vs-incremental lives in the integration (the delegate), not the
+        // queue. Without this notification a still-active recording keeps emitting incrementals
+        // against a full the player never received — orphaned nodes that render as a white screen.
+        val fakeInnerQueue = createFakeQueue()
+        val queue = createReplayQueue(fakeInnerQueue)
+        val delegate = MockReplayBufferDelegate().apply { isBuffering = true }
+        queue.bufferDelegate = delegate
+
+        queue.add(createTestEvent("snapshot_1"))
+        awaitReplayExecutors()
+        assertEquals(0, delegate.bufferClearedCallCount)
+
+        queue.clearBuffer()
+        awaitReplayExecutors()
+
+        assertEquals(0, queue.bufferDepth)
+        assertEquals(1, delegate.bufferClearedCallCount)
     }
 
     @Test
@@ -536,6 +565,8 @@ internal class PostHogReplayQueueTest {
                         isBuffering = false
                     }
                 }
+
+                override fun onBufferCleared() {}
             }
         queue.bufferDelegate = delegate
 
