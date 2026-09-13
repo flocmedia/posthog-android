@@ -810,10 +810,14 @@ public class PostHogReplayIntegration(
         // contains its stickers/text/in-layout dialogs, so dropping the overlays loses no
         // content and makes the stomp structurally impossible. Screenshot mode is unaffected.
         if (!useScreenshot) {
-            val screen = view.context.screenSize()
-            if (screen != null &&
-                (wireframe.width < screen.width * 4 / 5 || wireframe.height < screen.height * 7 / 10)
-            ) {
+            // Absolute dp floor rather than a screen-relative ratio: screenSize() is
+            // unreliable for popup/overlay window contexts (it can return null, or the
+            // popup's own tiny size), which let the stompers slip through. Wireframe
+            // dimensions are in dp; every real content screen here is ~392x850dp, while
+            // the selection/drag overlays are 32-64dp — so a generous floor cleanly
+            // separates them with no dependency on measuring the display.
+            if (wireframe.width < MIN_CONTENT_WINDOW_DP || wireframe.height < MIN_CONTENT_WINDOW_HEIGHT_DP) {
+                android.util.Log.i("RWSF", "SKIP overlay window ${wireframe.width}x${wireframe.height}")
                 return false
             }
         }
@@ -2665,5 +2669,14 @@ public class PostHogReplayIntegration(
         private const val MAX_BASELINE_ARM_ATTEMPTS: Int = 3
 
         private val integrationInstalled = AtomicBoolean(false)
+
+        // GAME-1236 / posthog-android#752 — the minimum wireframe size (dp) a decor view
+        // must have to be captured in wireframe mode. Real content screens are hundreds
+        // of dp in both dimensions; the editor library's selection/drag overlay windows
+        // are only tens of dp and, captured as separate documents under the shared
+        // $window_id, white out the editor. These floors sit well above the overlays and
+        // well below any full screen.
+        private const val MIN_CONTENT_WINDOW_DP: Int = 200
+        private const val MIN_CONTENT_WINDOW_HEIGHT_DP: Int = 300
     }
 }
