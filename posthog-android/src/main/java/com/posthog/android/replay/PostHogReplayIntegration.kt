@@ -131,6 +131,18 @@ public class PostHogReplayIntegration(
     // rich windows (see the guard in generateSnapshot) and emitting each as a single-root
     // document. Dialogs and lone-image overlays are dropped, so no secondary window can stomp,
     // and there is never a multi-root full snapshot (which the player renders inconsistently).
+    //
+    // Because all content windows share ONE $window_id and the player keeps ONE document there,
+    // a single-root full from window B replaces window A's document. When window A returns to the
+    // foreground (export share screen -> back to editor; editor -> back to the landing after
+    // export), its per-view sentFullSnapshot is still true, so it would emit INCREMENTAL mutations
+    // against B's document — node ids that don't exist there — and the screen whites out again at
+    // the transition. currentDocumentOwner tracks which decor view's full is the live document; a
+    // draw from any other view re-emits a full (and takes ownership) instead of an incremental.
+    // Written and read only on the snapshot executor (generateSnapshot) plus cleared under
+    // clearSnapshotStates; a WeakReference so it never pins a destroyed decor view.
+    @Volatile
+    private var currentDocumentOwner: WeakReference<View>? = null
 
     private val passwordInputTypes =
         setOf(
@@ -888,7 +900,11 @@ public class PostHogReplayIntegration(
             // document swap the player handles cleanly; nothing left can stomp the screen white.
             val prevLastSnapshot = status.lastSnapshot
             status.lastSnapshot = wireframe
-            if (!status.sentFullSnapshot) {
+            // Re-anchor when a different content window now owns the shared single-root document
+            // (a foreground switch back to a previously-captured window). Emitting an incremental
+            // here would diff against the other window's document and orphan every node -> white.
+            val ownsDocument = currentDocumentOwner?.get() === view
+            if (!status.sentFullSnapshot || !ownsDocument) {
                 events.add(
                     RRFullSnapshotEvent(
                         listOf(wireframe),
@@ -898,6 +914,7 @@ public class PostHogReplayIntegration(
                     ),
                 )
                 status.sentFullSnapshot = true
+                currentDocumentOwner = WeakReference(view)
             } else {
                 buildIncrementalSnapshot(prevLastSnapshot, wireframe, timestamp)?.let {
                     events.add(it)
@@ -2207,6 +2224,8 @@ public class PostHogReplayIntegration(
                 resetViewSnapshotStates(it.value)
             }
         }
+        // Drop document ownership too, so the next capture re-anchors with a fresh full (GAME-1236).
+        currentDocumentOwner = null
     }
 
     override fun stop() {
