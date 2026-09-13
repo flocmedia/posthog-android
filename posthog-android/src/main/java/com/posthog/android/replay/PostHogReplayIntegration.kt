@@ -250,6 +250,10 @@ public class PostHogReplayIntegration(
             override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
                 this@PostHogReplayIntegration.onReplayBufferSnapshot(replayQueue)
             }
+
+            override fun onBufferCleared() {
+                this@PostHogReplayIntegration.onReplayBufferCleared()
+            }
         }
 
     internal fun onDrawCallback(drawState: WindowDrawState) {
@@ -2380,6 +2384,37 @@ public class PostHogReplayIntegration(
         }
 
         migrateBufferIfMinimumDurationMet(replayQueue)
+    }
+
+    /**
+     * Re-anchor after the buffer was dropped ([PostHogReplayQueue.clearBuffer]).
+     *
+     * The drop discarded any buffered FULL snapshot, but per-view snapshot state still says a full
+     * was sent, so a still-active (or about-to-resume) recording would keep emitting INCREMENTAL
+     * mutations the player can't anchor — the GAME-1236 blank/white screen. Clearing the per-view
+     * state forces the next capture to be a fresh meta + full snapshot; the redraw kicks that
+     * capture promptly on an otherwise static screen (the landing after export), rather than
+     * waiting for the next user-driven onDraw.
+     *
+     * Scheduled on the snapshot executor so the state reset is ordered against generateSnapshot
+     * (which runs there too) — the reset lands before the next capture instead of racing it. The
+     * redraw is posted to the main thread, as View.postInvalidate requires. Both are safe when
+     * recording is inactive: the reset only affects the next capture, and a redraw whose snapshot
+     * finds recording stopped self-drops.
+     */
+    private fun onReplayBufferCleared() {
+        try {
+            executor.submit {
+                clearSnapshotStates()
+            }
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay re-anchor after buffer clear failed: $e.")
+        }
+        mainHandler.handler.post {
+            synchronized(decorViews) {
+                decorViews.keys.forEach { it.postInvalidate() }
+            }
+        }
     }
 
     /**
