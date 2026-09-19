@@ -28,6 +28,7 @@ import com.posthog.android.replay.internal.NextDrawListener
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.internal.EndpointSpec
+import com.posthog.internal.replay.RRWireframe
 import com.posthog.internal.PostHogApi
 import com.posthog.internal.PostHogDateProvider
 import com.posthog.internal.PostHogDeviceDateProvider
@@ -2388,5 +2389,72 @@ internal class PostHogReplayIntegrationTest {
         } finally {
             h.fx.sut.uninstall()
         }
+    }
+
+    // ---- GAME-1277: a subtree must be inserted once per node -------------------
+    //
+    // findAddedAndRemovedItems is fed the FLATTENED trees, so every descendant is
+    // already present as its own entry with its own parentId. Emitting those
+    // entries with childWireframes still attached makes rrweb materialize each
+    // descendant twice -- once from inside an ancestor's payload, once from its
+    // own -- and re-inserting a live id corrupts the mirror, which is why the
+    // player went white the moment a sticker (a 12-node graphic) was placed.
+    //
+    // Fail-on-purpose: drop either `.copy(childWireframes = null)` in
+    // findAddedAndRemovedItems and both of these go red.
+
+    private fun wf(
+        id: Int,
+        parentId: Int? = null,
+        width: Int = 10,
+        children: List<RRWireframe>? = null,
+    ) = RRWireframe(
+        id = id, x = 0, y = 0, width = width, height = 10,
+        parentId = parentId, childWireframes = children,
+    )
+
+    /** Every id reachable from these wireframes, counted with multiplicity. */
+    private fun reachableIds(items: List<RRWireframe>): List<Int> {
+        val out = mutableListOf<Int>()
+        fun walk(n: RRWireframe) {
+            out.add(n.id)
+            n.childWireframes?.forEach { walk(it) }
+        }
+        items.forEach { walk(it) }
+        return out
+    }
+
+    @Test
+    fun `a newly added subtree emits each node id exactly once`() {
+        val sut = getSut()
+        // What flattenChildren() yields: pre-order, children still attached.
+        val leaf = wf(102, parentId = 101)
+        val mid = wf(101, parentId = 100, children = listOf(leaf))
+        val top = wf(100, parentId = 1, children = listOf(mid))
+        val oldItems = listOf(wf(1))
+        val newItems = listOf(wf(1, children = listOf(top)), top, mid, leaf)
+
+        val (added, _, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        val ids = reachableIds(added)
+        assertEquals(listOf(100, 101, 102), ids.sorted())
+        assertEquals(ids.size, ids.toSet().size, "an id was added more than once: $ids")
+        assertTrue(added.all { it.childWireframes == null }, "added nodes must not carry children")
+    }
+
+    @Test
+    fun `an updated node does not re-send its subtree`() {
+        val sut = getSut()
+        val leaf = wf(101, parentId = 100)
+        val before = wf(100, parentId = 1, width = 10, children = listOf(leaf))
+        val after = wf(100, parentId = 1, width = 99, children = listOf(leaf))
+        val oldItems = listOf(wf(1, children = listOf(before)), before, leaf)
+        val newItems = listOf(wf(1, children = listOf(after)), after, leaf)
+
+        val (_, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(100), updated.map { it.id })
+        assertEquals(listOf(100), reachableIds(updated), "the update re-sent its subtree")
+        assertTrue(updated.all { it.childWireframes == null }, "updated nodes must not carry children")
     }
 }

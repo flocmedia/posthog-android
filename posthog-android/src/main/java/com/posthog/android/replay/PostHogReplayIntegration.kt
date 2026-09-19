@@ -2088,7 +2088,10 @@ public class PostHogReplayIntegration(
         return result
     }
 
-    private fun findAddedAndRemovedItems(
+    // internal (not private) so tests can drive the diff directly with synthetic
+    // trees -- GAME-1277 is a property of this function's output alone and needs
+    // no device, no views and no Robolectric window plumbing to pin.
+    internal fun findAddedAndRemovedItems(
         oldItems: List<RRWireframe>,
         newItems: List<RRWireframe>,
     ): Triple<List<RRWireframe>, List<RRWireframe>, List<RRWireframe>> {
@@ -2101,7 +2104,14 @@ public class PostHogReplayIntegration(
 
         // Find added items by subtracting oldItemIds from newItemIds
         val addedIds = newItemIds - oldItemIds
-        val addedItems = newItems.filter { it.id in addedIds }
+        // Strip childWireframes before emitting. `newItems` is ALREADY flattened
+        // (flattenChildren, pre-order), so every descendant is present as its own
+        // entry carrying its own parentId -- keeping the nested children here makes
+        // rrweb materialize each descendant TWICE: once from inside its ancestor's
+        // payload, then again from its own entry. Re-inserting an id that is already
+        // in the mirror corrupts it, and the player renders white the moment a
+        // subtree appears (placing a sticker adds a 12-node graphic). See GAME-1277.
+        val addedItems = newItems.filter { it.id in addedIds }.map { it.copy(childWireframes = null) }
 
         // Find removed items by subtracting newItemIds from oldItemIds
         val removedIds = oldItemIds - newItemIds
@@ -2119,9 +2129,14 @@ public class PostHogReplayIntegration(
             val newItem = newMap[id] ?: continue
             val newItemCopy = newItem.copy(childWireframes = null)
 
-            // If the items are different (any property has a different value), add the new item to the updatedItems list
+            // If the items are different (any property has a different value), add the new item to the updatedItems list.
+            // GAME-1277: emit the CHILD-STRIPPED copy, not `newItem`. The comparison
+            // above already had to drop childWireframes to compare just this node;
+            // shipping the unstripped node would re-send its whole subtree on every
+            // attribute change, duplicating ids that are already in the mirror for
+            // exactly the same reason as the added-items path above.
             if (oldItem != newItemCopy) {
-                updatedItems.add(newItem)
+                updatedItems.add(newItemCopy)
             }
         }
 
