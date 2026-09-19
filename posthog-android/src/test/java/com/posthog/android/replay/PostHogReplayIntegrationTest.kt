@@ -29,6 +29,10 @@ import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.internal.EndpointSpec
 import com.posthog.internal.replay.RRWireframe
+import com.posthog.internal.replay.RRRemovedNode
+import com.posthog.internal.replay.RRMutatedNode
+import com.posthog.internal.replay.RRIncrementalSnapshotEvent
+import com.posthog.internal.replay.RRIncrementalMutationData
 import com.posthog.internal.PostHogApi
 import com.posthog.internal.PostHogDateProvider
 import com.posthog.internal.PostHogDeviceDateProvider
@@ -2443,8 +2447,12 @@ internal class PostHogReplayIntegrationTest {
     }
 
     @Test
-    fun `an updated node does not re-send its subtree`() {
+    fun `an updated node carries its subtree`() {
         val sut = getSut()
+        // The player rewrites an update into remove(P) + add(P), and builds that add
+        // with cloneWithoutChildren. A remove takes the whole subtree, so shipping P
+        // alone destroys its children and brings P back EMPTY -- upstream expects the
+        // update to carry the tree ("we don't want to diff on the client").
         val leaf = wf(101, parentId = 100)
         val before = wf(100, parentId = 1, width = 10, children = listOf(leaf))
         val after = wf(100, parentId = 1, width = 99, children = listOf(leaf))
@@ -2454,7 +2462,155 @@ internal class PostHogReplayIntegrationTest {
         val (_, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
 
         assertEquals(listOf(100), updated.map { it.id })
-        assertEquals(listOf(100), reachableIds(updated), "the update re-sent its subtree")
-        assertTrue(updated.all { it.childWireframes == null }, "updated nodes must not carry children")
+        assertEquals(
+            listOf(101),
+            updated.single().childWireframes?.map { it.id },
+            "the update must carry its subtree or the player re-adds 100 empty",
+        )
+    }
+
+    @Test
+    fun `updates are emitted parent-first, not in hash order`() {
+        val sut = getSut()
+        // Update order is load-bearing: every update becomes remove+add, rrweb applies
+        // ALL removes before ANY add, so a child re-added ahead of its parent is
+        // dropped for good. Ids are chosen so a HashSet intersection does NOT
+        // enumerate them in tree order.
+        val ids = listOf(100, 7, 4096, 33, 2)
+        var parent: Int? = 1
+        val chain = ids.map { id -> val w = wf(id, parentId = parent); parent = id; w }
+        val oldChain = chain.map { it.copy(width = 10) }
+        val newChain = chain.map { it.copy(width = 99) }
+        val (_, _, updated) = sut.findAddedAndRemovedItems(
+            listOf(wf(1)) + oldChain,
+            listOf(wf(1)) + newChain,
+        )
+
+        // Only the outermost changed node ships; it carries the rest.
+        assertEquals(listOf(100), updated.map { it.id }, "nested updates must collapse to the root")
+    }
+
+    // ---- GAME-1277: rrweb removes SUBTREES, this diff is a flat id set --------
+    //
+    // A node whose ancestor is removed while the node itself survives in the new
+    // tree appears in BOTH id sets, so an id-set diff calls it neither added nor
+    // removed and emits nothing for it. rrweb still destroys it along with the
+    // removed ancestor, while the SDK goes on believing it is live -- so every
+    // later mutation touching it is silently dropped and, with one full snapshot
+    // per session, the document never recovers. Measured on a real drive: 164
+    // nodes destroyed in the player the SDK never removed, 225 later adds
+    // orphaned. Fail-on-purpose: delete the reAddedIds pass and all four go red.
+
+    @Test
+    fun `a node retained under a removed parent is re-added`() {
+        val sut = getSut()
+        // 100 is removed; its child 101 survives, re-parented onto the root.
+        val oldItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 100))
+        val newItems = listOf(wf(1), wf(101, parentId = 1))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(100), removed.map { it.id })
+        assertEquals(
+            listOf(101),
+            added.map { it.id },
+            "101 survives but rrweb deletes it with parent 100, so it must be re-added",
+        )
+        assertEquals(1, added.single().parentId, "must be re-added under its NEW parent")
+    }
+
+    @Test
+    fun `the whole retained subtree is re-added, not just its root`() {
+        val sut = getSut()
+        // 100 removed; 101 and its own child 102 both survive beneath it.
+        val oldItems = listOf(
+            wf(1), wf(100, parentId = 1), wf(101, parentId = 100), wf(102, parentId = 101),
+        )
+        val newItems = listOf(wf(1), wf(101, parentId = 1), wf(102, parentId = 101))
+
+        val (added, _, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        // childWireframes are stripped, so re-adding 101 alone does NOT restore 102.
+        assertEquals(listOf(101, 102), added.map { it.id })
+        assertTrue(
+            added.map { it.id }.indexOf(101) < added.map { it.id }.indexOf(102),
+            "adds must stay parent-first or rrweb drops the child",
+        )
+    }
+
+    @Test
+    fun `a moved node is re-added under its new parent`() {
+        val sut = getSut()
+        // Nothing is removed; 102 simply changes parent. An id-set diff sees no
+        // change at all, so without the move pass the player keeps it where it was.
+        val oldItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 1), wf(102, parentId = 100))
+        val newItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 1), wf(102, parentId = 101))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(removed.isEmpty())
+        assertEquals(listOf(102), added.map { it.id })
+        assertEquals(101, added.single().parentId)
+    }
+
+    @Test
+    fun `a steady tree emits no adds`() {
+        val sut = getSut()
+        val items = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 100))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(items, items)
+
+        assertTrue(added.isEmpty(), "unchanged tree must not re-add anything: $added")
+        assertTrue(removed.isEmpty())
+    }
+
+    // ---- GAME-1277: an update and an add under it destroy each other ----------
+    //
+    // The player rewrites a mobile update into remove(P) + add(P) and appends the
+    // synthesized add AFTER the real adds, so a mutation carrying both an update
+    // of P and an add under P loses the added node entirely: P is removed with its
+    // whole subtree, the add orphans, P returns empty. Fail-on-purpose: delete the
+    // resolveUpdateAddCollisions call and both of these go red.
+
+    @Test
+    fun `an add under an updated node travels with that node's update`() {
+        val sut = getSut()
+        val newChild = wf(200, parentId = 100)
+        val before = wf(100, parentId = 1, width = 10)
+        val after = wf(100, parentId = 1, width = 99, children = listOf(newChild))
+        val oldItems = listOf(wf(1, children = listOf(before)), before)
+        val newItems = listOf(wf(1, children = listOf(after)), after, newChild)
+
+        val (added, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(
+            added.none { it.id == 200 },
+            "200 must not ship as a standalone add -- the player drops it when 100 is removed",
+        )
+        val carrier = updated.single { it.id == 100 }
+        assertEquals(
+            listOf(200),
+            carrier.childWireframes?.map { it.id },
+            "the colliding update must carry its new subtree, or 100 is re-added empty",
+        )
+    }
+
+    @Test
+    fun `an add elsewhere is unaffected by an unrelated update`() {
+        val sut = getSut()
+        val newChild = wf(200, parentId = 101)
+        val before = wf(100, parentId = 1, width = 10)
+        val after = wf(100, parentId = 1, width = 99)
+        val sibling = wf(101, parentId = 1)
+        val oldItems = listOf(wf(1), before, sibling)
+        val newItems = listOf(wf(1), after, sibling, newChild)
+
+        val (added, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(200), added.map { it.id }, "a non-colliding add must still ship")
+        assertTrue(
+            updated.single { it.id == 100 }.childWireframes == null,
+            "a non-colliding update must stay child-stripped",
+        )
     }
 }

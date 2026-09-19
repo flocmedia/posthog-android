@@ -12,6 +12,14 @@ internal class ViewTreeSnapshotStatus(
     var sentMetaEvent: Boolean = false,
     var keyboardVisible: Boolean = false,
     var lastSnapshot: RRWireframe? = null,
+    // GAME-1277: the node ids the PLAYER's document should currently hold. The diff
+    // is computed against our own lastSnapshot, but the player's document is what the
+    // mutations actually land on, and the two drift apart as soon as one mutation is
+    // lossy -- after which every later add can reference a parent the player no longer
+    // has, is dropped, and the replay bleeds content it can never recover (a session
+    // otherwise emits exactly ONE full snapshot). Tracking it lets us detect the drift
+    // and re-anchor instead of shipping a mutation that corrupts the mirror.
+    var documentIds: HashSet<Int>? = null,
     val drawState: WindowDrawState = WindowDrawState(),
 )
 
