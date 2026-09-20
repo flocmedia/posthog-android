@@ -28,6 +28,11 @@ import com.posthog.android.replay.internal.NextDrawListener
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.internal.EndpointSpec
+import com.posthog.internal.replay.RRWireframe
+import com.posthog.internal.replay.RRRemovedNode
+import com.posthog.internal.replay.RRMutatedNode
+import com.posthog.internal.replay.RRIncrementalSnapshotEvent
+import com.posthog.internal.replay.RRIncrementalMutationData
 import com.posthog.internal.PostHogApi
 import com.posthog.internal.PostHogDateProvider
 import com.posthog.internal.PostHogDeviceDateProvider
@@ -2388,5 +2393,276 @@ internal class PostHogReplayIntegrationTest {
         } finally {
             h.fx.sut.uninstall()
         }
+    }
+
+    // ---- GAME-1277: a subtree must be inserted once per node -------------------
+    //
+    // findAddedAndRemovedItems is fed the FLATTENED trees, so every descendant is
+    // already present as its own entry with its own parentId. Emitting those
+    // entries with childWireframes still attached makes rrweb materialize each
+    // descendant twice -- once from inside an ancestor's payload, once from its
+    // own -- and re-inserting a live id corrupts the mirror, which is why the
+    // player went white the moment a sticker (a 12-node graphic) was placed.
+    //
+    // Fail-on-purpose: drop either `.copy(childWireframes = null)` in
+    // findAddedAndRemovedItems and both of these go red.
+
+    private fun wf(
+        id: Int,
+        parentId: Int? = null,
+        width: Int = 10,
+        children: List<RRWireframe>? = null,
+    ) = RRWireframe(
+        id = id, x = 0, y = 0, width = width, height = 10,
+        parentId = parentId, childWireframes = children,
+    )
+
+    /** Every id reachable from these wireframes, counted with multiplicity. */
+    private fun reachableIds(items: List<RRWireframe>): List<Int> {
+        val out = mutableListOf<Int>()
+        fun walk(n: RRWireframe) {
+            out.add(n.id)
+            n.childWireframes?.forEach { walk(it) }
+        }
+        items.forEach { walk(it) }
+        return out
+    }
+
+    @Test
+    fun `a newly added subtree emits each node id exactly once`() {
+        val sut = getSut()
+        // What flattenChildren() yields: pre-order, children still attached.
+        val leaf = wf(102, parentId = 101)
+        val mid = wf(101, parentId = 100, children = listOf(leaf))
+        val top = wf(100, parentId = 1, children = listOf(mid))
+        val oldItems = listOf(wf(1))
+        val newItems = listOf(wf(1, children = listOf(top)), top, mid, leaf)
+
+        val (added, _, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        val ids = reachableIds(added)
+        assertEquals(listOf(100, 101, 102), ids.sorted())
+        assertEquals(ids.size, ids.toSet().size, "an id was added more than once: $ids")
+        assertTrue(added.all { it.childWireframes == null }, "added nodes must not carry children")
+    }
+
+    @Test
+    fun `an updated node carries its subtree`() {
+        val sut = getSut()
+        // The player rewrites an update into remove(P) + add(P), and builds that add
+        // with cloneWithoutChildren. A remove takes the whole subtree, so shipping P
+        // alone destroys its children and brings P back EMPTY -- upstream expects the
+        // update to carry the tree ("we don't want to diff on the client").
+        val leaf = wf(101, parentId = 100)
+        val before = wf(100, parentId = 1, width = 10, children = listOf(leaf))
+        val after = wf(100, parentId = 1, width = 99, children = listOf(leaf))
+        val oldItems = listOf(wf(1, children = listOf(before)), before, leaf)
+        val newItems = listOf(wf(1, children = listOf(after)), after, leaf)
+
+        val (_, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(100), updated.map { it.id })
+        assertEquals(
+            listOf(101),
+            updated.single().childWireframes?.map { it.id },
+            "the update must carry its subtree or the player re-adds 100 empty",
+        )
+    }
+
+    @Test
+    fun `updates are emitted parent-first, not in hash order`() {
+        val sut = getSut()
+        // Update order is load-bearing: every update becomes remove+add, rrweb applies
+        // ALL removes before ANY add, so a child re-added ahead of its parent is
+        // dropped for good. Ids are chosen so a HashSet intersection does NOT
+        // enumerate them in tree order.
+        val ids = listOf(100, 7, 4096, 33, 2)
+        var parent: Int? = 1
+        val chain = ids.map { id -> val w = wf(id, parentId = parent); parent = id; w }
+        val oldChain = chain.map { it.copy(width = 10) }
+        val newChain = chain.map { it.copy(width = 99) }
+        val (_, _, updated) = sut.findAddedAndRemovedItems(
+            listOf(wf(1)) + oldChain,
+            listOf(wf(1)) + newChain,
+        )
+
+        // Only the outermost changed node ships; it carries the rest.
+        assertEquals(listOf(100), updated.map { it.id }, "nested updates must collapse to the root")
+    }
+
+    // ---- GAME-1277: rrweb removes SUBTREES, this diff is a flat id set --------
+    //
+    // A node whose ancestor is removed while the node itself survives in the new
+    // tree appears in BOTH id sets, so an id-set diff calls it neither added nor
+    // removed and emits nothing for it. rrweb still destroys it along with the
+    // removed ancestor, while the SDK goes on believing it is live -- so every
+    // later mutation touching it is silently dropped and, with one full snapshot
+    // per session, the document never recovers. Measured on a real drive: 164
+    // nodes destroyed in the player the SDK never removed, 225 later adds
+    // orphaned. Fail-on-purpose: delete the reAddedIds pass and all four go red.
+
+    @Test
+    fun `a node retained under a removed parent is re-added`() {
+        val sut = getSut()
+        // 100 is removed; its child 101 survives, re-parented onto the root.
+        val oldItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 100))
+        val newItems = listOf(wf(1), wf(101, parentId = 1))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(100), removed.map { it.id })
+        assertEquals(
+            listOf(101),
+            added.map { it.id },
+            "101 survives but rrweb deletes it with parent 100, so it must be re-added",
+        )
+        assertEquals(1, added.single().parentId, "must be re-added under its NEW parent")
+    }
+
+    @Test
+    fun `the whole retained subtree is re-added, not just its root`() {
+        val sut = getSut()
+        // 100 removed; 101 and its own child 102 both survive beneath it.
+        val oldItems = listOf(
+            wf(1), wf(100, parentId = 1), wf(101, parentId = 100), wf(102, parentId = 101),
+        )
+        val newItems = listOf(wf(1), wf(101, parentId = 1), wf(102, parentId = 101))
+
+        val (added, _, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        // childWireframes are stripped, so re-adding 101 alone does NOT restore 102.
+        assertEquals(listOf(101, 102), added.map { it.id })
+        assertTrue(
+            added.map { it.id }.indexOf(101) < added.map { it.id }.indexOf(102),
+            "adds must stay parent-first or rrweb drops the child",
+        )
+    }
+
+    @Test
+    fun `a moved node is re-added under its new parent`() {
+        val sut = getSut()
+        // Nothing is removed; 102 simply changes parent. An id-set diff sees no
+        // change at all, so without the move pass the player keeps it where it was.
+        val oldItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 1), wf(102, parentId = 100))
+        val newItems = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 1), wf(102, parentId = 101))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(removed.isEmpty())
+        assertEquals(listOf(102), added.map { it.id })
+        assertEquals(101, added.single().parentId)
+    }
+
+    @Test
+    fun `a steady tree emits no adds`() {
+        val sut = getSut()
+        val items = listOf(wf(1), wf(100, parentId = 1), wf(101, parentId = 100))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(items, items)
+
+        assertTrue(added.isEmpty(), "unchanged tree must not re-add anything: $added")
+        assertTrue(removed.isEmpty())
+    }
+
+    // ---- GAME-1277: an update and an add under it destroy each other ----------
+    //
+    // The player rewrites a mobile update into remove(P) + add(P) and appends the
+    // synthesized add AFTER the real adds, so a mutation carrying both an update
+    // of P and an add under P loses the added node entirely: P is removed with its
+    // whole subtree, the add orphans, P returns empty. Fail-on-purpose: delete the
+    // resolveUpdateAddCollisions call and both of these go red.
+
+    @Test
+    fun `an add under an updated node travels with that node's update`() {
+        val sut = getSut()
+        val newChild = wf(200, parentId = 100)
+        val before = wf(100, parentId = 1, width = 10)
+        val after = wf(100, parentId = 1, width = 99, children = listOf(newChild))
+        val oldItems = listOf(wf(1, children = listOf(before)), before)
+        val newItems = listOf(wf(1, children = listOf(after)), after, newChild)
+
+        val (added, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(
+            added.none { it.id == 200 },
+            "200 must not ship as a standalone add -- the player drops it when 100 is removed",
+        )
+        val carrier = updated.single { it.id == 100 }
+        assertEquals(
+            listOf(200),
+            carrier.childWireframes?.map { it.id },
+            "the colliding update must carry its new subtree, or 100 is re-added empty",
+        )
+    }
+
+    @Test
+    fun `an add elsewhere is unaffected by an unrelated update`() {
+        val sut = getSut()
+        val newChild = wf(200, parentId = 101)
+        val before = wf(100, parentId = 1, width = 10)
+        val after = wf(100, parentId = 1, width = 99)
+        val sibling = wf(101, parentId = 1)
+        val oldItems = listOf(wf(1), before, sibling)
+        val newItems = listOf(wf(1), after, sibling, newChild)
+
+        val (added, _, updated) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(200), added.map { it.id }, "a non-colliding add must still ship")
+        assertTrue(
+            updated.single { it.id == 100 }.childWireframes == null,
+            "a non-colliding update must stay child-stripped",
+        )
+    }
+
+    // ---- GAME-1277: keep an <img> out of the first three adds -----------------
+    //
+    // The player peeks at the first THREE adds of a mutation; an <img> there makes
+    // it synthesize a minimal full snapshot holding only that image, wiping the
+    // document (process-all-snapshots.ts, isLikelyMobileScreenshot). Our images
+    // are 16-32px ICONS, so this fires constantly in wireframe mode. Padding the
+    // front with an ancestor's containers is the only lever we have.
+    // Fail-on-purpose: delete the avoidScreenshotMisdetection call and both go red.
+
+    private fun img(id: Int, parentId: Int?) =
+        RRWireframe(id = id, x = 0, y = 0, width = 32, height = 32, parentId = parentId, type = "image")
+
+    @Test
+    fun `an image add is padded out of the player's sniff window`() {
+        val sut = getSut()
+        // A sticker graphic: root -> border -> blend -> the image itself.
+        val image = img(104, parentId = 103)
+        val blend = wf(103, parentId = 102)
+        val border = wf(102, parentId = 101)
+        val root = wf(101, parentId = 1)
+        val oldItems = listOf(wf(1), root, border, blend)
+        val newItems = listOf(wf(1), root, border, blend, image)
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(
+            added.take(3).none { it.type == "image" },
+            "an <img> in the first 3 adds costs the whole document: ${added.map { it.id to it.type }}",
+        )
+        assertTrue(added.any { it.id == 104 }, "the image must still arrive")
+        assertTrue(
+            removed.any { it.id in setOf(101, 102) },
+            "padding works by removing an ancestor and re-adding its subtree",
+        )
+        // Parent-first, or rrweb drops the children.
+        val ids = added.map { it.id }
+        assertTrue(ids.indexOf(101) < ids.indexOf(104), "ancestor must precede the image")
+    }
+
+    @Test
+    fun `a mutation with no image adds is left alone`() {
+        val sut = getSut()
+        val added0 = wf(200, parentId = 1)
+        val oldItems = listOf(wf(1))
+        val newItems = listOf(wf(1), added0)
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(200), added.map { it.id }, "no image, so nothing to pad")
+        assertTrue(removed.isEmpty(), "padding must not invent removes")
     }
 }
