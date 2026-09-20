@@ -2613,4 +2613,56 @@ internal class PostHogReplayIntegrationTest {
             "a non-colliding update must stay child-stripped",
         )
     }
+
+    // ---- GAME-1277: keep an <img> out of the first three adds -----------------
+    //
+    // The player peeks at the first THREE adds of a mutation; an <img> there makes
+    // it synthesize a minimal full snapshot holding only that image, wiping the
+    // document (process-all-snapshots.ts, isLikelyMobileScreenshot). Our images
+    // are 16-32px ICONS, so this fires constantly in wireframe mode. Padding the
+    // front with an ancestor's containers is the only lever we have.
+    // Fail-on-purpose: delete the avoidScreenshotMisdetection call and both go red.
+
+    private fun img(id: Int, parentId: Int?) =
+        RRWireframe(id = id, x = 0, y = 0, width = 32, height = 32, parentId = parentId, type = "image")
+
+    @Test
+    fun `an image add is padded out of the player's sniff window`() {
+        val sut = getSut()
+        // A sticker graphic: root -> border -> blend -> the image itself.
+        val image = img(104, parentId = 103)
+        val blend = wf(103, parentId = 102)
+        val border = wf(102, parentId = 101)
+        val root = wf(101, parentId = 1)
+        val oldItems = listOf(wf(1), root, border, blend)
+        val newItems = listOf(wf(1), root, border, blend, image)
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertTrue(
+            added.take(3).none { it.type == "image" },
+            "an <img> in the first 3 adds costs the whole document: ${added.map { it.id to it.type }}",
+        )
+        assertTrue(added.any { it.id == 104 }, "the image must still arrive")
+        assertTrue(
+            removed.any { it.id in setOf(101, 102) },
+            "padding works by removing an ancestor and re-adding its subtree",
+        )
+        // Parent-first, or rrweb drops the children.
+        val ids = added.map { it.id }
+        assertTrue(ids.indexOf(101) < ids.indexOf(104), "ancestor must precede the image")
+    }
+
+    @Test
+    fun `a mutation with no image adds is left alone`() {
+        val sut = getSut()
+        val added0 = wf(200, parentId = 1)
+        val oldItems = listOf(wf(1))
+        val newItems = listOf(wf(1), added0)
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(200), added.map { it.id }, "no image, so nothing to pad")
+        assertTrue(removed.isEmpty(), "padding must not invent removes")
+    }
 }

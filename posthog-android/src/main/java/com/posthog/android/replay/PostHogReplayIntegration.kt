@@ -2190,8 +2190,100 @@ public class PostHogReplayIntegration(
             }
         }
 
-        return buildUpdates(addedItems, removedItems, changedIds, newItems, newMap)
+        val (adds, removes, updates) = buildUpdates(addedItems, removedItems, changedIds, newItems, newMap)
+        return avoidScreenshotMisdetection(adds, removes, updates, newItems, oldItemIds)
     }
+
+    /**
+     * GAME-1277: keep an <img> out of the first three adds, or the player throws
+     * the whole recording away.
+     *
+     * The web player classifies a mutation by peeking at its first THREE adds: if
+     * any of them is an <img> carrying data-rrweb-id + width + height it decides
+     * the mutation "is likely a mobile screenshot", synthesizes a minimal full
+     * snapshot containing ONLY that image, and pushes it -- replacing the entire
+     * replayed document with a single <html><head><body><img>. See
+     * posthog/common/replay-shared/src/snapshot-processing/process-all-snapshots.ts,
+     * extractImgNodeFromMobileIncremental / isLikelyMobileScreenshot.
+     *
+     * In wireframe mode that heuristic is simply wrong: our images are 16x16,
+     * 24x24 and 32x32 ICONS, not screenshots. Measured on a real S24 drive, 10
+     * mutations tripped it, and each one wiped the editor and left one toolbar
+     * icon alone on a blank page -- exactly the "single corner re-size icon" and
+     * "side stretch icons" seen in the dashboard, and the reason the replay looks
+     * white. The document measures 4 nodes when it happens: html/head/body/img.
+     *
+     * We cannot patch the player, but the check only reads indices 0..2, so it is
+     * enough that three non-image nodes come first. When an image would land in
+     * that window we remove one of its ancestors and re-add that ancestor's
+     * subtree in pre-order, which puts the ancestor's containers ahead of the
+     * image. rrweb applies removes before adds, so the remove+re-add is
+     * self-consistent and costs one subtree, not a keyframe.
+     *
+     * This is a WORKAROUND for an upstream player bug, not a fix. Revisit if
+     * isLikelyMobileScreenshot ever learns to tell an icon from a screenshot.
+     */
+    private fun avoidScreenshotMisdetection(
+        addedItems: List<RRWireframe>,
+        removedItems: List<RRWireframe>,
+        updatedItems: List<RRWireframe>,
+        newItems: List<RRWireframe>,
+        liveIds: Set<Int>,
+    ): Triple<List<RRWireframe>, List<RRWireframe>, List<RRWireframe>> {
+        val parentOf = newItems.associate { it.id to it.parentId }
+        val childrenOf = newItems.groupBy { it.parentId }
+
+        // Pre-order, matching how the player flattens a subtree into adds.
+        fun subtreeOf(rootId: Int): List<RRWireframe> {
+            val out = mutableListOf<RRWireframe>()
+            val seen = HashSet<Int>()
+            fun visit(node: RRWireframe) {
+                if (!seen.add(node.id)) return
+                out.add(node)
+                childrenOf[node.id].orEmpty().forEach(::visit)
+            }
+            newItems.firstOrNull { it.id == rootId }?.let(::visit)
+            return out
+        }
+
+        // The sniff window is over the adds the PLAYER ends up with, and every
+        // update becomes remove+add appended after the real adds, its subtree
+        // flattened in pre-order. So a mutation with no adds at all still fills
+        // indices 0..2 from its updates -- checking `addedItems` alone misses it,
+        // which is how 2 of the original 10 trips survived the first attempt.
+        val projected = addedItems + updatedItems.flatMap { subtreeOf(it.id) }
+        val offender = projected.take(SCREENSHOT_SNIFF_ADDS).firstOrNull { it.rendersAsImage() }
+            ?: return Triple(addedItems, removedItems, updatedItems)
+
+        // Walk up until an ancestor's own subtree front-loads enough non-image
+        // nodes. It must already be live, or removing it means nothing.
+        var candidate = parentOf[offender.id]
+        val guard = HashSet<Int>()
+        while (candidate != null && guard.add(candidate)) {
+            if (candidate in liveIds) {
+                val subtree = subtreeOf(candidate)
+                if (subtree.takeWhile { !it.rendersAsImage() }.size >= SCREENSHOT_SNIFF_ADDS) {
+                    val subtreeIds = subtree.mapTo(HashSet()) { it.id }
+                    return Triple(
+                        subtree.map { it.copy(childWireframes = null) } +
+                            addedItems.filter { it.id !in subtreeIds },
+                        removedItems + (newItems.firstOrNull { it.id == candidate } ?: break),
+                        // The re-add carries current values, so an update inside
+                        // the re-added subtree would only re-remove what we just
+                        // restored.
+                        updatedItems.filter { it.id !in subtreeIds },
+                    )
+                }
+            }
+            candidate = parentOf[candidate]
+        }
+
+        // No ancestor can pad it (a shallow tree, or nothing live to re-add).
+        // Shipping as-is is still better than dropping the mutation.
+        return Triple(addedItems, removedItems, updatedItems)
+    }
+
+    private fun RRWireframe.rendersAsImage(): Boolean = type == "image" || type == "screenshot"
 
     /**
      * GAME-1277: an update must carry its subtree, and only the outermost one.
@@ -2825,6 +2917,14 @@ public class PostHogReplayIntegration(
         // nodes; the editor library's lone-image selection/drag overlays (and stripped
         // system-bar roots) have ~1. This floor sits well above the overlays and well below
         // any real screen, and unlike a size threshold it catches a full-screen drag layer.
+        /**
+         * How many leading adds the web player sniffs when deciding a mutation
+         * "is likely a mobile screenshot" (process-all-snapshots.ts,
+         * extractImgNodeFromMobileIncremental uses Math.min(adds.length, 3)).
+         * An <img> inside this window costs the whole document. See GAME-1277.
+         */
+        private const val SCREENSHOT_SNIFF_ADDS: Int = 3
+
         private const val MIN_CONTENT_WINDOW_NODES: Int = 12
 
         // Minimum wireframe height (dp) for a decor view to count as a full-screen content
