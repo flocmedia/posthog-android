@@ -1,5 +1,136 @@
 ## Next
 
+## 3.67.0
+
+### Minor Changes
+
+- d0a59ab: Support survey targeting by a specific linked feature flag variant.
+
+## 3.66.4
+
+### Patch Changes
+
+- 9c83392: Support skipSubmitButton for survey rating and single-choice questions. The Compose renderer submits eligible selections immediately and hides the submit button; multiple-choice questions and single-choice questions with an open option retain explicit submission.
+
+## 3.66.3
+
+### Patch Changes
+
+- 26b78ae: Fix automatic deep-link capture for warm `singleTop` and `singleTask` activity launches. Call `setIntent(intent)` in `onNewIntent` so the SDK can capture the new intent on resume. Repeated resumes do not duplicate the event, while distinct intents with the same URL are captured separately.
+
+## 3.66.2
+
+### Patch Changes
+
+- 1293056: Stop sending the unused `platform` field when registering a device for push notifications. The API resolves the provider from `app_id` alone and ignores `platform`, so the field was dead weight. It was also the only field in the request without `@SerializedName`, which meant R8 renamed it in minified release builds. Removing it drops that failure mode instead of working around it.
+
+## 3.66.1
+
+### Patch Changes
+
+- 57ae6ed: fix: stop retrying push registration when the project API key is not valid
+  
+  A device that gets `401 invalid_api_key` from the registration endpoint stops sending push
+  registrations for that key instead of re-posting on every app open. Adds the internal
+  `PostHogPreferences.PUSH_SUBSCRIPTION_REJECTED` key, which holds that verdict and survives `reset()`.
+
+## 3.66.0
+
+### Minor Changes
+
+- 853ec7d: Add the internal `persistOptOut` config so a wrapper SDK that owns consent can stop a persisted opt-out from overriding the value it passes to setup.
+
+## 3.65.2
+
+### Patch Changes
+
+- e1523b5: Send `$groupidentify` through `capture()` so it carries the session id, identity flags and shared properties like every other event, matching posthog-js
+
+## 3.65.1
+
+### Patch Changes
+
+- 6e57336: Cut the heap a session replay screenshot needs. The Base64 encoder buffer was sized from the bitmap's `allocationByteCount`, so every capture reserved a second full uncompressed frame, about 10 MB on a 1080x2400 screen, for a payload that lands in the tens of kilobytes. The buffer is now sized from a compressed estimate, and the compressed bytes stream straight into the encoder instead of being held in an intermediate array. Devices with a small heap were running out of memory on this allocation at the default 1 second capture cadence.
+
+## 3.65.0
+
+### Minor Changes
+
+- 61c1a0e: Change `capturePushNotificationOpened` to skip a PostHog-sent notification open already captured in the last 5 minutes (same `invocation_id` and `action_id`), unless the payload's `google.message_id` differs.
+
+## 3.64.1
+
+### Patch Changes
+
+- 20c72a2: Move replay buffer initialization and leftover-file cleanup off the SDK setup thread onto the replay executor to reduce main-thread startup stalls, including when session replay is disabled.
+- 1ae7aed: Resolve the cache directory and package information at most once per SDK setup, only when needed, and reuse the results across startup consumers.
+
+## 3.64.0
+
+### Minor Changes
+
+- 58294dc: Add `PostHogSessionReplayConfig.captureTouches` (default `true`) to disable touch coordinate recording during SDK initialization independently of screenshots and view capture. Runtime changes are not supported.
+
+## 3.63.1
+
+### Patch Changes
+
+- 231caaf: Discard replay snapshots that cross a recording stop or session change, preserving the next session's initial keyframe and the captured frame's session identity.
+
+## 3.63.0
+
+### Minor Changes
+
+- 80a5370: Add experimental `sessionReplayConfig.screenshotScale`, `screenshotCompressionQuality`, and `screenshotColorMode` options. Scale is clamped to 0.1–1.0 and WebP quality to 0–100; defaults remain full resolution, quality 30, and ARGB_8888. RGB_565 can reduce bitmap memory at the cost of color precision and alpha. Screenshot destinations are reused when available, and idle destinations are released when recording stops; pending PixelCopy destinations are never reused before completion.
+
+## 3.62.0
+
+### Minor Changes
+
+- 5e3267b: Add `PostHogAndroid.capturePushNotificationOpened(intent)` to capture `$push_notification_opened` for a launch intent the SDK was installed too late to read. In the published test fixtures, `PostHogFake.optOut()` and `optIn()` now change what `isOptOut()` returns, where they were previously no-ops.
+
+## 3.61.3
+
+### Patch Changes
+
+- 0e6d7a4: Fix: a session recording started by an event trigger now checks the same gates as every other start path. A matching event used to start recording even when `PostHogConfig.sessionReplay` was false, the project flag was off, or sampling excluded the session, so an app that gates replay behind its own feature flag recorded the users the flag excluded. A manual start can still wait for a matching event, and `PostHog.stopSessionReplay` cancels that pending request.
+
+## 3.61.2
+
+### Patch Changes
+
+- 456f790: Skip redundant session replay captures while a window has a queued capture or unfinished PixelCopy callback.
+
+## 3.61.1
+
+### Patch Changes
+
+- da718a6: Fix: session replay no longer discards every screenshot on Jetpack Compose apps. A Compose window recomposes on almost every frame, and the default redraw guard can never classify a Compose redraw as animation-only, so it dropped each frame and the recording showed a blank gray screen (and, with no first snapshot, "this recording can't be played"). Compose-rooted windows now use the mask-alignment verification path, which keeps frames through pixel-only redraws. Session replay also logs a warning after several screenshots are discarded in a row, so a blank recording is no longer silent.
+
+## 3.61.0
+
+### Minor Changes
+
+- 0f6b31a: Re-publish `posthog-android` so it resolves `posthog` 6.34.0, which carries the survey intro screen appearance fields (`displayIntroScreen`, `introScreenHeader`, `introScreenDescription`, `introScreenDescriptionContentType`, `introScreenButtonText`). `posthog-android` exposes the core SDK via `api`, so custom survey delegates consuming `PostHogDisplaySurveyAppearance` through this artifact could not see the new fields while its published dependency stayed pinned to 6.33.7.
+
+## 3.60.8
+
+### Patch Changes
+
+- 58aa3e7: Fix surveys scoped to web via a CSS selector or URL display condition leaking onto native Android. Surveys with `conditions.url` and/or `conditions.selector` are now excluded from active matching surveys, since those conditions can only be evaluated in a browser DOM. This mirrors the exclusion already shipped in posthog-ios and posthog-react-native.
+
+## 3.60.7
+
+### Patch Changes
+
+- e0827f0: Fix session replay started with `sessionReplay = false` staying stopped for the rest of the process after an internal stop, such as the session being cleared while the app is backgrounded.
+
+## 3.60.6
+
+### Patch Changes
+
+- 31b805f: Prevent malformed survey JSON from throwing while logging deserialization errors.
+
 ## 3.60.5
 
 ### Patch Changes

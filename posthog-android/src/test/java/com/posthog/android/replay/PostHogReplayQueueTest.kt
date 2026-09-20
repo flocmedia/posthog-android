@@ -3,8 +3,10 @@ package com.posthog.android.replay
 import com.posthog.PostHogConfig
 import com.posthog.PostHogEvent
 import com.posthog.android.API_KEY
+import com.posthog.android.PostHogAndroidConfig
 import com.posthog.internal.EndpointSpec
 import com.posthog.internal.PostHogApi
+import com.posthog.internal.PostHogApiEndpoint
 import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import org.junit.Rule
@@ -20,6 +22,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 internal class PostHogReplayQueueTest {
@@ -30,7 +34,14 @@ internal class PostHogReplayQueueTest {
 
     @AfterTest
     fun tearDown() {
-        executors.forEach { it.shutdownNow() }
+        executors.forEach {
+            if (it is PausedExecutorService) {
+                it.shutdownNow()
+            } else {
+                it.shutdown()
+                assertTrue(it.awaitTermination(2, TimeUnit.SECONDS))
+            }
+        }
         executors.clear()
     }
 
@@ -65,16 +76,11 @@ internal class PostHogReplayQueueTest {
         override var isBuffering: Boolean = false
         override var isActive: Boolean = true
         var didBufferSnapshotCallCount: Int = 0
-        var bufferClearedCallCount: Int = 0
         var lastReplayQueue: PostHogReplayQueue? = null
 
         override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
             didBufferSnapshotCallCount++
             lastReplayQueue = replayQueue
-        }
-
-        override fun onBufferCleared() {
-            bufferClearedCallCount++
         }
     }
 
@@ -196,6 +202,83 @@ internal class PostHogReplayQueueTest {
     }
 
     @Test
+    fun `queue provider defers buffer cleanup even with replay disabled`() {
+        val config = PostHogAndroidConfig(API_KEY)
+        val storagePrefix = File(tmpDir.root, "replay").absolutePath
+        val bufferDir = File("$storagePrefix-buffer", API_KEY)
+        bufferDir.mkdirs()
+        val leftover = File(bufferDir, "leftover.event").apply { writeText("old data") }
+        val executor = createPausedExecutor()
+        assertFalse(config.sessionReplay)
+
+        val queue =
+            config.queueProvider(config, PostHogApi(config), PostHogApiEndpoint.SNAPSHOT, storagePrefix, executor)
+                as PostHogReplayQueue
+
+        assertTrue(leftover.exists())
+        assertEquals(0, queue.bufferDepth)
+        assertNull(queue.bufferDurationMs)
+        assertEquals(1, executor.queuedTaskCount)
+
+        executor.runNext()
+
+        assertFalse(leftover.exists())
+        assertTrue(bufferDir.isDirectory)
+        assertTrue(bufferDir.listFiles()!!.isEmpty())
+    }
+
+    @Test
+    fun `construction does not create buffer directory`() {
+        val storagePrefix = File(tmpDir.root, "replay").absolutePath
+        val bufferDir = File("$storagePrefix-buffer", API_KEY)
+        val executor = createPausedExecutor()
+        val queue = createReplayQueue(createFakeQueue(), storagePrefix, executor)
+
+        assertEquals(0, queue.bufferDepth)
+        assertNull(queue.bufferDurationMs)
+        assertFalse(bufferDir.exists())
+        assertEquals(1, executor.queuedTaskCount)
+
+        executor.runNext()
+
+        assertTrue(bufferDir.isDirectory)
+    }
+
+    @Test
+    fun `initial cleanup precedes buffered writes and subsequent clears`() {
+        val config = PostHogConfig(API_KEY)
+        val storagePrefix = File(tmpDir.root, "replay").absolutePath
+        val bufferDir = File("$storagePrefix-buffer", API_KEY)
+        bufferDir.mkdirs()
+        val leftover = File(bufferDir, "leftover.event").apply { writeText("old data") }
+        val executor = createPausedExecutor()
+        val queue = createReplayQueue(createFakeQueue(), storagePrefix, executor)
+        queue.bufferDelegate = MockReplayBufferDelegate().apply { isBuffering = true }
+
+        queue.add(createTestEvent("before_clear"))
+        queue.clearBuffer()
+        queue.add(createTestEvent("after_clear"))
+
+        assertTrue(leftover.exists())
+        assertEquals(4, executor.queuedTaskCount)
+        executor.runNext()
+        assertFalse(leftover.exists())
+        assertEquals(0, queue.bufferDepth)
+
+        executor.runNext()
+        assertEquals(listOf("before_clear"), eventNamesInDirectory(config, bufferDir))
+        assertEquals(1, queue.bufferDepth)
+
+        executor.runNext()
+        assertTrue(bufferDir.listFiles()!!.isEmpty())
+        assertEquals(0, queue.bufferDepth)
+
+        executor.runNext()
+        assertEquals(listOf("after_clear"), eventNamesInDirectory(config, bufferDir))
+        assertEquals(1, queue.bufferDepth)
+    }
+
+    @Test
     fun `add routes to buffer when delegate isBuffering is true`() {
         val fakeInnerQueue = createFakeQueue()
         val queue = createReplayQueue(fakeInnerQueue)
@@ -216,6 +299,7 @@ internal class PostHogReplayQueueTest {
         val fakeInnerQueue = createFakeQueue()
         val executor = createPausedExecutor()
         val queue = createReplayQueue(fakeInnerQueue, executor = executor)
+        executor.runNext()
         val delegate = MockReplayBufferDelegate().apply { isBuffering = true }
         queue.bufferDelegate = delegate
 
@@ -238,6 +322,7 @@ internal class PostHogReplayQueueTest {
         val fakeInnerQueue = createFakeQueue()
         val executor = createPausedExecutor()
         val queue = createReplayQueue(fakeInnerQueue, executor = executor)
+        executor.runNext()
         val delegate = MockReplayBufferDelegate().apply { isBuffering = true }
         queue.bufferDelegate = delegate
 
@@ -288,6 +373,7 @@ internal class PostHogReplayQueueTest {
         val fakeInnerQueue = createFakeQueue()
         val executor = createPausedExecutor()
         val queue = createReplayQueue(fakeInnerQueue, executor = executor)
+        executor.runNext()
         val delegate =
             MockReplayBufferDelegate().apply {
                 isBuffering = true
@@ -408,8 +494,6 @@ internal class PostHogReplayQueueTest {
                         }
                     }
                 }
-
-                override fun onBufferCleared() {}
             }
         queue.bufferDelegate = delegate
 
@@ -448,28 +532,6 @@ internal class PostHogReplayQueueTest {
         awaitReplayExecutors()
 
         assertEquals(0, queue.bufferDepth)
-    }
-
-    @Test
-    fun `clearBuffer notifies delegate so it can re-anchor snapshot state`() {
-        // GAME-1236: a buffer drop discards any buffered FULL snapshot, but the per-view snapshot
-        // state that decides full-vs-incremental lives in the integration (the delegate), not the
-        // queue. Without this notification a still-active recording keeps emitting incrementals
-        // against a full the player never received — orphaned nodes that render as a white screen.
-        val fakeInnerQueue = createFakeQueue()
-        val queue = createReplayQueue(fakeInnerQueue)
-        val delegate = MockReplayBufferDelegate().apply { isBuffering = true }
-        queue.bufferDelegate = delegate
-
-        queue.add(createTestEvent("snapshot_1"))
-        awaitReplayExecutors()
-        assertEquals(0, delegate.bufferClearedCallCount)
-
-        queue.clearBuffer()
-        awaitReplayExecutors()
-
-        assertEquals(0, queue.bufferDepth)
-        assertEquals(1, delegate.bufferClearedCallCount)
     }
 
     @Test
@@ -565,8 +627,6 @@ internal class PostHogReplayQueueTest {
                         isBuffering = false
                     }
                 }
-
-                override fun onBufferCleared() {}
             }
         queue.bufferDelegate = delegate
 

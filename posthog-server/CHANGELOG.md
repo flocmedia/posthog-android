@@ -1,5 +1,53 @@
 ## Next
 
+## 2.17.0
+
+### Minor Changes
+
+- 853ec7d: Add the internal `persistOptOut` config so a wrapper SDK that owns consent can stop a persisted opt-out from overriding the value it passes to setup.
+
+## 2.16.1
+
+### Patch Changes
+
+- 5e3267b: Add `PostHogAndroid.capturePushNotificationOpened(intent)` to capture `$push_notification_opened` for a launch intent the SDK was installed too late to read. In the published test fixtures, `PostHogFake.optOut()` and `optIn()` now change what `isOptOut()` returns, where they were previously no-ops.
+
+## 2.16.0
+
+### Minor Changes
+
+- 7e6bbc5: Add `captureUncaughtExceptions`: opt in to capturing uncaught JVM exceptions as error tracking events, with a best-effort flush before the process exits. The SDK's flush timer is now a daemon thread and no longer keeps a finished JVM alive until `close()`.
+
+## 2.15.7
+
+### Patch Changes
+
+- 02172d5: Match local feature flag string operators using the flags service's boolean coercion, JSON stringification, and case rules.
+
+## 2.15.6
+
+### Patch Changes
+
+- 8ef048b: Align local `is_set` and `is_not_set` evaluation with partial property context.
+
+## 2.15.5
+
+### Patch Changes
+
+- cd99553: Bound repeated remote probes for missing flag keys until local definitions refresh.
+
+## 2.15.4
+
+### Patch Changes
+
+- 954bff7: Return an empty server flag snapshot when evaluation receives an explicit empty key scope.
+
+## 2.15.3
+
+### Patch Changes
+
+- 35969a5: Keep built server options unchanged when their builders are reused.
+
 ## 2.15.2
 
 ### Patch Changes

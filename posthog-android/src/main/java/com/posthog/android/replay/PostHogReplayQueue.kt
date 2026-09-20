@@ -34,6 +34,13 @@ internal class PostHogReplayQueue internal constructor(
             },
         )
 
+    init {
+        // Queue cleanup before any writes, without doing disk IO on the setup caller's thread.
+        executor.executeSafely {
+            bufferQueue.clear()
+        }
+    }
+
     internal var bufferDelegate: PostHogReplayBufferDelegate? = null
 
     /**
@@ -131,12 +138,6 @@ internal class PostHogReplayQueue internal constructor(
         executor.executeSafely {
             bufferQueue.clear()
             config.logger.log("Replay buffer cleared")
-            // A drop discards any buffered FULL snapshot; tell the delegate so it can re-anchor the
-            // per-view snapshot state (which it owns), otherwise a still-active recording keeps
-            // emitting incrementals against a full the player never received → orphaned/white
-            // screen (GAME-1236). The delegate re-dispatches onto the integration's snapshot
-            // executor so the reset is ordered against generateSnapshot.
-            bufferDelegate?.onBufferCleared()
         }
     }
 }

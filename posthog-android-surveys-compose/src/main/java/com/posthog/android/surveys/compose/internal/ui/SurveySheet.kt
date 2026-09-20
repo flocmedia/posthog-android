@@ -95,6 +95,16 @@ internal fun SurveySheet(
 
     var currentQuestionIndex by rememberSaveable { mutableStateOf(0) }
     var showingConfirmation by rememberSaveable { mutableStateOf(false) }
+    // Advancing past the intro is a pure UI transition: no response is recorded and no
+    // survey event is sent. The X button keeps dismissing the whole survey as usual.
+    // The intro has no default header, so an intro with no copy at all is skipped instead
+    // of drawing an empty sheet with a lone button (resolve() normalizes blank copy to null).
+    var showingIntroScreen by rememberSaveable {
+        mutableStateOf(
+            appearance.displayIntroScreen &&
+                (appearance.introScreenHeader != null || appearance.introScreenDescription != null),
+        )
+    }
     val question = survey.questions.getOrNull(currentQuestionIndex)
 
     LaunchedEffect(survey.id) {
@@ -172,6 +182,8 @@ internal fun SurveySheet(
                 ) {
                     if (showingConfirmation || question == null) {
                         ConfirmationScreen(onClose = dismissSheet)
+                    } else if (showingIntroScreen) {
+                        IntroScreen(onStart = { showingIntroScreen = false })
                     } else {
                         QuestionContent(
                             question = question,
@@ -225,26 +237,34 @@ private fun RatingQuestionDispatch(
 ) {
     var rating by rememberSaveable(question.id) { mutableStateOf<Int?>(null) }
     val canSubmit = question.isOptional || rating != null
+    val onRatingSelected: (Int?) -> Unit = { value ->
+        rating = value
+        if (question.skipSubmitButton && value != null) {
+            onSubmit(PostHogSurveyResponse.Rating(value))
+        }
+    }
 
     QuestionHeader(question)
     if (question.ratingType == PostHogDisplaySurveyRatingType.EMOJI) {
         EmojiRating(
             question = question,
             selectedValue = rating,
-            onSelect = { rating = it },
+            onSelect = onRatingSelected,
         )
     } else {
         NumberRating(
             question = question,
             selectedValue = rating,
-            onSelect = { rating = it },
+            onSelect = onRatingSelected,
         )
     }
-    BottomSection(
-        label = question.buttonText ?: localAppearance().submitButtonText,
-        enabled = canSubmit,
-        onClick = { onSubmit(PostHogSurveyResponse.Rating(rating)) },
-    )
+    if (!question.skipSubmitButton) {
+        BottomSection(
+            label = question.buttonText ?: localAppearance().submitButtonText,
+            enabled = canSubmit,
+            onClick = { onSubmit(PostHogSurveyResponse.Rating(rating)) },
+        )
+    }
 }
 
 @Composable
@@ -301,18 +321,25 @@ private fun SingleChoiceQuestionDispatch(
     SingleChoice(
         question = question,
         selectedChoice = selected,
-        onSelectedChoiceChange = { selected = it },
+        onSelectedChoiceChange = { value ->
+            selected = value
+            if (question.shouldAutoSubmit && value != null) {
+                onSubmit(PostHogSurveyResponse.SingleChoice(value))
+            }
+        },
         openChoiceInput = openInput,
         onOpenChoiceInputChange = { openInput = it },
     )
-    BottomSection(
-        label = question.buttonText ?: localAppearance().submitButtonText,
-        enabled = canSubmit,
-        onClick = {
-            val response = if (hasOpenChoiceSelected) openInput.trim() else selected
-            onSubmit(PostHogSurveyResponse.SingleChoice(response))
-        },
-    )
+    if (!question.shouldAutoSubmit) {
+        BottomSection(
+            label = question.buttonText ?: localAppearance().submitButtonText,
+            enabled = canSubmit,
+            onClick = {
+                val response = if (hasOpenChoiceSelected) openInput.trim() else selected
+                onSubmit(PostHogSurveyResponse.SingleChoice(response))
+            },
+        )
+    }
 }
 
 @Composable

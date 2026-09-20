@@ -1,5 +1,35 @@
 # posthog-android-surveys-compose
 
+## 0.3.1
+
+### Patch Changes
+
+- 8090aee: Leave open-text survey inputs empty when no placeholder is configured.
+
+## 0.3.0
+
+### Minor Changes
+
+- 9c83392: Support skipSubmitButton for survey rating and single-choice questions. The Compose renderer submits eligible selections immediately and hides the submit button; multiple-choice questions and single-choice questions with an open option retain explicit submission.
+
+## 0.2.2
+
+### Patch Changes
+
+- b3b0d22: Honor survey shuffleOptions in the built-in choice UI, keeping Other last and the display order stable while answering.
+
+## 0.2.1
+
+### Patch Changes
+
+- 5e3267b: Add `PostHogAndroid.capturePushNotificationOpened(intent)` to capture `$push_notification_opened` for a launch intent the SDK was installed too late to read. In the published test fixtures, `PostHogFake.optOut()` and `optIn()` now change what `isOptOut()` returns, where they were previously no-ops.
+
+## 0.2.0
+
+### Minor Changes
+
+- 0704cf4: Surveys can now display an optional intro screen before the first question, configured via the new `displayIntroScreen`, `introScreenHeader`, `introScreenDescription`, `introScreenDescriptionContentType`, and `introScreenButtonText` appearance fields (mirroring the existing thank-you message fields, including translations). The fields are exposed on `SurveyAppearance` and `PostHogDisplaySurveyAppearance` for custom survey delegates, and the Compose UI module renders the intro screen natively. Advancing past the intro records no response and sends no survey event; dismissing the survey from the intro still sends the normal `survey dismissed` event.
+
 ## 0.1.0
 
 ### Minor Changes

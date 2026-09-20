@@ -56,6 +56,7 @@ import androidx.compose.ui.semantics.SemanticsPropertyKey
 import androidx.compose.ui.semantics.getAllSemanticsNodes
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.posthog.PostHogEventName
 import com.posthog.PostHogIntegration
 import com.posthog.PostHogInterface
 import com.posthog.android.PostHogAndroidConfig
@@ -71,6 +72,7 @@ import com.posthog.android.replay.internal.BaselineResult
 import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -107,6 +109,8 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.ceil
+import kotlin.math.floor
 
 public class PostHogReplayIntegration(
     private val context: Context,
@@ -120,29 +124,9 @@ public class PostHogReplayIntegration(
     internal val decorViews: MutableMap<View, ViewTreeSnapshotStatus> =
         Collections.synchronizedMap(WeakHashMap<View, ViewTreeSnapshotStatus>())
 
-    // GAME-1236 / posthog-android#752 — single-root wireframe documents (wireframe mode only).
-    //
-    // posthog-android snapshots every Android decor view (Activity, dialogs, popups, the editor
-    // library's selection/drag overlays) independently but ships them all under one $window_id,
-    // and the web player keeps ONE rrweb document per $window_id — a full snapshot resets it. So
-    // a secondary window's full snapshot replaces the Activity's document and every later
-    // Activity mutation orphans: the screen renders white. We satisfy the #752 invariant ("one
-    // $window_id = one internally consistent document") by capturing ONLY full-screen, content-
-    // rich windows (see the guard in generateSnapshot) and emitting each as a single-root
-    // document. Dialogs and lone-image overlays are dropped, so no secondary window can stomp,
-    // and there is never a multi-root full snapshot (which the player renders inconsistently).
-    //
-    // Because all content windows share ONE $window_id and the player keeps ONE document there,
-    // a single-root full from window B replaces window A's document. When window A returns to the
-    // foreground (export share screen -> back to editor; editor -> back to the landing after
-    // export), its per-view sentFullSnapshot is still true, so it would emit INCREMENTAL mutations
-    // against B's document — node ids that don't exist there — and the screen whites out again at
-    // the transition. currentDocumentOwner tracks which decor view's full is the live document; a
-    // draw from any other view re-emits a full (and takes ownership) instead of an incremental.
-    // Written and read only on the snapshot executor (generateSnapshot) plus cleared under
-    // clearSnapshotStates; a WeakReference so it never pins a destroyed decor view.
-    @Volatile
-    private var currentDocumentOwner: WeakReference<View>? = null
+    // Guarded by decorViews, together with snapshot-state commits. Stop/resume in the same
+    // session must invalidate work too, so session identity alone is not a sufficient lease.
+    private var snapshotGeneration: Long = 0
 
     private val passwordInputTypes =
         setOf(
@@ -173,6 +157,7 @@ public class PostHogReplayIntegration(
     //  directly, eliminating the need for a HandlerThread entirely. Requires compileSdk 34+.
     private var pixelCopyThread: HandlerThread? = null
     private var pixelCopyHandler: Handler? = null
+    private val pixelCopyBitmapBuffer = PixelCopyBitmapBuffer()
 
     private fun ensurePixelCopyHandler(): Handler {
         pixelCopyThread?.let { thread ->
@@ -201,20 +186,14 @@ public class PostHogReplayIntegration(
             color = Color.BLACK
         }
 
-    private enum class RecordingState {
-        INACTIVE,
-        AUTOMATIC,
-        MANUAL,
-    }
-
     @Volatile
-    private var recordingState: RecordingState = RecordingState.INACTIVE
+    private var isSessionReplayActive: Boolean = false
 
-    private val isSessionReplayActive: Boolean
-        get() = recordingState != RecordingState.INACTIVE
-
-    private val isManualSessionReplayActive: Boolean
-        get() = recordingState == RecordingState.MANUAL
+    // Set only by an explicit start request made while config.sessionReplay is false. It survives
+    // stopRecording() so an internal stop (session cleared, sampled out, flag off) can still resume
+    // later; only an explicit stop() or uninstall() clears it.
+    @Volatile
+    private var startedWithAutomaticDisabled: Boolean = false
 
     // Event triggers for session recording
     private val eventTriggersLock = Any()
@@ -262,10 +241,6 @@ public class PostHogReplayIntegration(
             override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
                 this@PostHogReplayIntegration.onReplayBufferSnapshot(replayQueue)
             }
-
-            override fun onBufferCleared() {
-                this@PostHogReplayIntegration.onReplayBufferCleared()
-            }
         }
 
     internal fun onDrawCallback(drawState: WindowDrawState) {
@@ -283,7 +258,7 @@ public class PostHogReplayIntegration(
         drawState.recordDraw()
 
         val classifyLegacyDraw =
-            !config.sessionReplayConfig.verifyScreenshotMaskAlignment ||
+            !shouldVerifyMaskAlignment(view, drawState) ||
                 drawState.isLegacyCaptureActive
         if (classifyLegacyDraw) {
             val screenshotCapable = config.sessionReplayConfig.screenshot || !isNativeSdk
@@ -368,8 +343,11 @@ public class PostHogReplayIntegration(
                                             return@onNextDraw
                                         }
 
-                                        executor.submit {
+                                        submitCapture(drawState) {
                                             try {
+                                                if (decorViews[decorView]?.drawState !== drawState) {
+                                                    return@submitCapture
+                                                }
                                                 generateSnapshot(WeakReference(decorView), WeakReference(window))
                                             } catch (e: Throwable) {
                                                 config.logger.log("Session Replay generateSnapshot failed: $e.")
@@ -405,6 +383,29 @@ public class PostHogReplayIntegration(
         } catch (e: Throwable) {
             config.logger.log("Session Replay OnRootViewsChangedListener failed: $e.")
         }
+    }
+
+    // Acquire before submitting, not on the worker: a busy worker must not accumulate
+    // redundant captures. Draw-time mask verification still runs for every draw.
+    internal fun submitCapture(
+        drawState: WindowDrawState,
+        capture: () -> Unit,
+    ): Boolean {
+        if (!drawState.tryScheduleCapture()) return false
+        try {
+            executor.submit {
+                try {
+                    capture()
+                } finally {
+                    drawState.finishScheduledCapture()
+                }
+            }
+        } catch (e: Throwable) {
+            drawState.finishScheduledCapture()
+            config.logger.log("Session Replay capture submission failed: $e.")
+            return false
+        }
+        return true
     }
 
     private val onRootViewsChangedListener =
@@ -446,7 +447,7 @@ public class PostHogReplayIntegration(
             try {
                 val state = dispatch(motionEvent)
                 try {
-                    if (!isActive()) {
+                    if (!config.sessionReplayConfig.captureTouches || !isActive()) {
                         return@TouchEventInterceptor state
                     }
                     val timestamp = config.dateProvider.currentTimeMillis()
@@ -524,7 +525,7 @@ public class PostHogReplayIntegration(
         status.sentMetaEvent = false
         status.keyboardVisible = false
         status.lastSnapshot = null
-        status.drawState.invalidateMaskCapture()
+        status.drawState.resetSnapshotState()
     }
 
     private fun clearViewListeners(
@@ -596,6 +597,7 @@ public class PostHogReplayIntegration(
             return
         }
         try {
+            stopRecording()
             this.postHog = null
 
             // Clear buffer delegate
@@ -613,7 +615,7 @@ public class PostHogReplayIntegration(
                 status.drawState.invalidateMaskCapture()
             }
 
-            recordingState = RecordingState.INACTIVE
+            startedWithAutomaticDisabled = false
 
             pixelCopyThread?.quitSafely()
             pixelCopyThread = null
@@ -627,6 +629,18 @@ public class PostHogReplayIntegration(
         } finally {
             ownsInstallation = false
             integrationInstalled.set(false)
+            try {
+                synchronized(pixelCopyBitmapBuffer) {
+                    synchronized(decorViews) {
+                        startedWithAutomaticDisabled = false
+                        isSessionReplayActive = false
+                        snapshotGeneration++
+                        pixelCopyBitmapBuffer.close()
+                    }
+                }
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay screenshot buffer cleanup failed: $e.")
+            }
         }
     }
 
@@ -645,7 +659,8 @@ public class PostHogReplayIntegration(
      *
      * The return value only means the capture was scheduled; [onResult] fires on
      * the capture thread with whether a frame was actually delivered — callers
-     * must treat that, not the return value, as the retry signal.
+     * must treat that, not the return value, as the retry signal. Returns false without
+     * calling [onResult] if this window already has a pending/in-flight capture.
      */
     @PostHogInternalReplayApi
     public fun captureSessionReplaySnapshot(
@@ -675,13 +690,14 @@ public class PostHogReplayIntegration(
                 return false
             }
             val window = decorView.phoneWindow ?: return false
-            if (decorViews[decorView] == null) {
+            val drawState = decorViews[decorView]?.drawState
+            if (drawState == null) {
                 // Not tracked yet (onDecorViewReady pending): generateSnapshot
                 // would bail silently — report failure so the caller retries
                 // and the first-of-episode reset is not consumed.
                 return false
             }
-            executor.submit {
+            return submitCapture(drawState) {
                 // A throwing onResult would land in the catch below and fire a
                 // second time — report exactly once per scheduled capture.
                 var resultReported = false
@@ -696,18 +712,20 @@ public class PostHogReplayIntegration(
                     // the capture thread: the reset mutates snapshot status
                     // fields that are otherwise only touched here, and a
                     // stale queued capture must not emit after the episode.
-                    if (!isStillValid()) {
+                    if (!isStillValid() || decorViews[decorView]?.drawState !== drawState) {
                         // The contract promises onResult for every scheduled
                         // capture; a silent self-drop would leave the caller's
                         // in-flight tracking latched forever.
                         report(false)
-                        return@submit
+                        return@submitCapture
                     }
                     if (forceFullSnapshot) {
-                        decorViews[decorView]?.let { status ->
-                            status.sentFullSnapshot = false
-                            status.sentMetaEvent = false
-                            status.lastSnapshot = null
+                        synchronized(decorViews) {
+                            decorViews[decorView]?.let { status ->
+                                status.sentFullSnapshot = false
+                                status.sentMetaEvent = false
+                                status.lastSnapshot = null
+                            }
                         }
                     }
                     val delivered = generateSnapshot(WeakReference(decorView), WeakReference(window), forceScreenshot = true)
@@ -720,7 +738,6 @@ public class PostHogReplayIntegration(
                     report(false)
                 }
             }
-            return true
         } catch (e: Throwable) {
             config.logger.log("Session Replay bridge capture failed: $e.")
             return false
@@ -739,45 +756,6 @@ public class PostHogReplayIntegration(
         }?.toRGBColor()
     }
 
-    // Total number of wireframe nodes in a subtree (the root plus all descendants).
-    // Used to tell a real content window from a lone-image overlay (GAME-1236 / #752).
-    private fun subtreeNodeCount(wireframe: RRWireframe): Int {
-        var count = 1
-        wireframe.childWireframes?.forEach { count += subtreeNodeCount(it) }
-        return count
-    }
-
-    // Diff a decor view's previous wireframe against its current one and package the
-    // node adds/removes/updates as an incremental snapshot, or null if nothing changed.
-    // Extracted so both the screenshot path and the composite-scene path share it.
-    private fun buildIncrementalSnapshot(
-        last: RRWireframe?,
-        current: RRWireframe,
-        timestamp: Long,
-    ): RRIncrementalSnapshotEvent? {
-        val lastSnapshots = if (last != null) listOf(last) else emptyList()
-        val (addedItems, removedItems, updatedItems) =
-            findAddedAndRemovedItems(
-                lastSnapshots.flattenChildren(),
-                listOf(current).flattenChildren(),
-            )
-        val addedNodes = addedItems.map { RRMutatedNode(it, parentId = it.parentId) }
-        val removedNodes = removedItems.map { RRRemovedNode(it.id, parentId = it.parentId) }
-        val updatedNodes = updatedItems.map { RRMutatedNode(it, parentId = it.parentId) }
-        if (addedNodes.isEmpty() && removedNodes.isEmpty() && updatedNodes.isEmpty()) {
-            return null
-        }
-        return RRIncrementalSnapshotEvent(
-            mutationData =
-                RRIncrementalMutationData(
-                    adds = addedNodes.ifEmpty { null },
-                    removes = removedNodes.ifEmpty { null },
-                    updates = updatedNodes.ifEmpty { null },
-                ),
-            timestamp = timestamp,
-        )
-    }
-
     // internal (not private) so tests can drive a snapshot pass directly.
     // Returns whether a frame was actually produced (false on every early bail),
     // so the bridge caller can tell "captured" from "silently skipped".
@@ -786,12 +764,17 @@ public class PostHogReplayIntegration(
         windowRef: WeakReference<Window>,
         forceScreenshot: Boolean = false,
     ): Boolean {
-        // Early bail if stopped and this is processing previous generateSnapshot() from executor.submit
         if (!isActive()) return false
-
+        val postHog = postHog ?: return false
+        // Resolve expiry before taking the producer lock: this getter can notify session listeners.
+        val sessionId = PostHogSessionManager.getActiveSessionId()?.toString() ?: return false
         val view = viewRef.get() ?: return false
-        val status = decorViews[view] ?: return false
         val window = windowRef.get() ?: return false
+        val (status, generation) =
+            synchronized(decorViews) {
+                if (!isActive() || replaySessionId != sessionId) return false
+                (decorViews[view] ?: return false) to snapshotGeneration
+            }
 
         // Check view is still alive to avoid native crashes
         if (!view.isAlive()) return false
@@ -799,7 +782,6 @@ public class PostHogReplayIntegration(
         val timestamp = config.dateProvider.currentTimeMillis()
 
         val useScreenshot = config.sessionReplayConfig.screenshot || forceScreenshot
-
         val wireframe =
             if (useScreenshot) {
                 view.toScreenshotWireframe(
@@ -810,38 +792,6 @@ public class PostHogReplayIntegration(
                 view.toWireframe() ?: return false
             }
 
-        // GAME-1236 / posthog-android#752 — in wireframe mode, only capture (near-)full-screen
-        // content windows. This app's editor library renders the selected sticker / drag
-        // handles in tiny separate decor views (a 32x32 / 56x56 single-image window), and
-        // every decor view is snapshotted independently but shipped under one shared
-        // $window_id. The web player keeps one document per $window_id, so a lone secondary
-        // FULL snapshot (that single image) resets the document and whites out the editor,
-        // with the image sitting on the blank screen. Those overlays are TYPE_BASE_APPLICATION
-        // just like the editor, so window type cannot tell them apart — but they are far
-        // smaller than the screen while the real content windows (the editor, the landing
-        // "Continue where you left off" screen, the share screen) fill it. The editor already
-        // contains its stickers/text/in-layout dialogs, so dropping the overlays loses no
-        // content and makes the stomp structurally impossible. Screenshot mode is unaffected.
-        if (!useScreenshot) {
-            // Capture ONLY full-screen, content-rich windows (GAME-1236 / posthog-android#752).
-            // Every Android decor view is snapshotted under the shared $window_id and the web
-            // player keeps one document per id, so any secondary window's full snapshot resets
-            // that document and whites out the screen. The foreground content screens here (the
-            // editor, the "Continue where you left off" landing, the share screen) fill the
-            // display and carry dozens of wireframe nodes; the things that stomp do not:
-            //   - the editor library's lone-image selection/drag overlays: ~1 node (any size),
-            //   - modal dialogs (the restore prompt 373x213, the "Loading…" popups 373x21x): short.
-            // Height separates a full-screen Activity (>=~700dp) from a floating dialog, and node
-            // count separates it from a lone-image overlay. Real dialogs in this app render
-            // in-layout (part of the Activity window), so dropping the separate ones loses no
-            // content. Measured across production exports: every content screen is 392x850 with
-            // 27-250 nodes; every stomper is a non-full-screen or ~1-node window.
-            val nodeCount = subtreeNodeCount(wireframe)
-            if (wireframe.height < MIN_FULLSCREEN_HEIGHT_DP || nodeCount < MIN_CONTENT_WINDOW_NODES) {
-                return false
-            }
-        }
-
         // if the decorView has no backgroundColor, we use the theme color
         // no need to do this if we are capturing a screenshot
         if (wireframe.style?.backgroundColor == null && !useScreenshot) {
@@ -850,15 +800,47 @@ public class PostHogReplayIntegration(
             }
         }
 
+        val events =
+            synchronized(decorViews) {
+                if (!isActive() || snapshotGeneration != generation || decorViews[view] !== status ||
+                    PostHogSessionManager.peekSessionId()?.toString() != sessionId
+                ) {
+                    return false
+                }
+                snapshotEvents(view, status, wireframe, timestamp) ?: return false
+            }
+
+        // Commit above is the producer boundary. Do not invoke SDK/user callbacks under its lock.
+        // A rotation after commit must not relabel this frame during core enrichment.
+        if (events.isNotEmpty()) {
+            postHog.capture(
+                PostHogEventName.SNAPSHOT.event,
+                properties =
+                    mapOf(
+                        "\$snapshot_data" to events,
+                        "\$snapshot_source" to "mobile",
+                        "\$session_id" to sessionId,
+                        "\$window_id" to sessionId,
+                    ),
+            )
+        }
+        return true
+    }
+
+    // Called under decorViews so a reset cannot be overwritten by an in-flight frame.
+    private fun snapshotEvents(
+        view: View,
+        status: ViewTreeSnapshotStatus,
+        wireframe: RRWireframe,
+        timestamp: Long,
+    ): List<RREvent>? {
         val events = mutableListOf<RREvent>()
 
-        // Per-view Meta (viewport/href): each captured full-screen window sends its own
-        // before its first full snapshot, matching the single-root document it produces.
         if (!status.sentMetaEvent) {
             val title = view.phoneWindow?.attributes?.title?.toString()?.substringAfter("/") ?: ""
             // TODO: cache and compare, if size changes, we send a ViewportResize event
 
-            val screenSizeInfo = view.context.screenSize() ?: return false
+            val screenSizeInfo = view.context.screenSize() ?: return null
 
             val metaEvent =
                 RRMetaEvent(
@@ -871,53 +853,57 @@ public class PostHogReplayIntegration(
             status.sentMetaEvent = true
         }
 
-        if (useScreenshot) {
-            // Screenshot mode: unchanged per-view behavior. Each snapshot is a
-            // full-screen bitmap, so there is no cross-window document to stomp.
-            if (!status.sentFullSnapshot) {
-                events.add(
-                    RRFullSnapshotEvent(
-                        listOf(wireframe),
-                        initialOffsetTop = 0,
-                        initialOffsetLeft = 0,
-                        timestamp = timestamp,
-                    ),
+        if (!status.sentFullSnapshot) {
+            val event =
+                RRFullSnapshotEvent(
+                    listOf(wireframe),
+                    initialOffsetTop = 0,
+                    initialOffsetLeft = 0,
+                    timestamp = timestamp,
                 )
-                status.sentFullSnapshot = true
-            } else {
-                buildIncrementalSnapshot(status.lastSnapshot, wireframe, timestamp)?.let {
-                    events.add(it)
-                }
-            }
+            events.add(event)
+            status.sentFullSnapshot = true
         } else {
-            // Wireframe mode (GAME-1236 / posthog-android#752): SINGLE-ROOT documents only.
-            // Only full-screen content windows reach here (the guard above dropped dialogs and
-            // lone-image overlays), so each is emitted as its own single-root full/incremental
-            // — never a multi-root composite, which the web player renders inconsistently (it
-            // keys off the first root, so a second window can hide the screen). A full-screen
-            // Activity replacing another (editor -> landing -> share) is a normal single-root
-            // document swap the player handles cleanly; nothing left can stomp the screen white.
-            val prevLastSnapshot = status.lastSnapshot
-            status.lastSnapshot = wireframe
-            // Re-anchor when a different content window now owns the shared single-root document
-            // (a foreground switch back to a previously-captured window). Emitting an incremental
-            // here would diff against the other window's document and orphan every node -> white.
-            val ownsDocument = currentDocumentOwner?.get() === view
-            if (!status.sentFullSnapshot || !ownsDocument) {
-                events.add(
-                    RRFullSnapshotEvent(
-                        listOf(wireframe),
-                        initialOffsetTop = 0,
-                        initialOffsetLeft = 0,
-                        timestamp = timestamp,
-                    ),
+            val lastSnapshot = status.lastSnapshot
+            val lastSnapshots = if (lastSnapshot != null) listOf(lastSnapshot) else emptyList()
+            val (addedItems, removedItems, updatedItems) =
+                findAddedAndRemovedItems(
+                    lastSnapshots.flattenChildren(),
+                    listOf(wireframe).flattenChildren(),
                 )
-                status.sentFullSnapshot = true
-                currentDocumentOwner = WeakReference(view)
-            } else {
-                buildIncrementalSnapshot(prevLastSnapshot, wireframe, timestamp)?.let {
-                    events.add(it)
-                }
+
+            val addedNodes = mutableListOf<RRMutatedNode>()
+            addedItems.forEach {
+                val item = RRMutatedNode(it, parentId = it.parentId)
+                addedNodes.add(item)
+            }
+
+            val removedNodes = mutableListOf<RRRemovedNode>()
+            removedItems.forEach {
+                val item = RRRemovedNode(it.id, parentId = it.parentId)
+                removedNodes.add(item)
+            }
+
+            val updatedNodes = mutableListOf<RRMutatedNode>()
+            updatedItems.forEach {
+                val item = RRMutatedNode(it, parentId = it.parentId)
+                updatedNodes.add(item)
+            }
+
+            if (addedNodes.isNotEmpty() || removedNodes.isNotEmpty() || updatedNodes.isNotEmpty()) {
+                val incrementalMutationData =
+                    RRIncrementalMutationData(
+                        adds = addedNodes.ifEmpty { null },
+                        removes = removedNodes.ifEmpty { null },
+                        updates = updatedNodes.ifEmpty { null },
+                    )
+
+                val incrementalSnapshotEvent =
+                    RRIncrementalSnapshotEvent(
+                        mutationData = incrementalMutationData,
+                        timestamp = timestamp,
+                    )
+                events.add(incrementalSnapshotEvent)
             }
         }
 
@@ -928,12 +914,8 @@ public class PostHogReplayIntegration(
             events.add(it)
         }
 
-        if (events.isNotEmpty()) {
-            events.capture(postHog)
-        }
-
         status.lastSnapshot = wireframe
-        return true
+        return events
     }
 
     /**
@@ -1240,6 +1222,42 @@ public class PostHogReplayIntegration(
             !isViewStateStableForMatrixOperations()
     }
 
+    // Inline when already on the main thread (posting there would deadlock); otherwise
+    // post-and-wait. Returns null on timeout or throw -- callers must treat that as failure.
+    private fun <T> runOnMainThreadBlocking(block: () -> T): T? {
+        if (Looper.myLooper() == mainHandler.handler.looper) {
+            return try {
+                block()
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay main-thread hop failed: $e")
+                null
+            }
+        }
+        val latch = CountDownLatch(1)
+        var result: T? = null
+        mainHandler.handler.post {
+            try {
+                // Caught here too: an uncaught throw would otherwise escape onto the
+                // main Looper and crash the host app.
+                result = block()
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay main-thread hop failed: $e")
+            } finally {
+                latch.countDown()
+            }
+        }
+        return try {
+            if (latch.await(1000, TimeUnit.MILLISECONDS)) result else null
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            config.logger.log("Session Replay main-thread hop failed: $e")
+            null
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay main-thread hop failed: $e")
+            null
+        }
+    }
+
     private fun findMaskableComposeWidgets(
         view: View,
         walk: MaskWalk,
@@ -1304,26 +1322,7 @@ public class PostHogReplayIntegration(
 
         // Compose requires main-thread access. Draw-time verification already runs on main, where
         // posting and waiting would deadlock, so execute inline in that case.
-        val completed =
-            if (Looper.myLooper() == mainHandler.handler.looper) {
-                traversal.run()
-                true
-            } else {
-                val latch = CountDownLatch(1)
-                mainHandler.handler.post {
-                    try {
-                        traversal.run()
-                    } finally {
-                        latch.countDown()
-                    }
-                }
-                try {
-                    latch.await(1000, TimeUnit.MILLISECONDS)
-                } catch (e: Throwable) {
-                    config.logger.log("Session Replay findMaskableComposeWidgets failed: $e")
-                    false
-                }
-            }
+        val completed = runOnMainThreadBlocking { traversal.run() } != null
 
         if (completed && traversalSucceeded) {
             // Feed through addRect on the walk's owner thread so compare mode also covers
@@ -1359,6 +1358,85 @@ public class PostHogReplayIntegration(
 
     private fun View.isComposeView(): Boolean {
         return isComposeAvailable && this.javaClass.name.contains(ANDROID_COMPOSE_VIEW)
+    }
+
+    // Compose recomposes on almost every frame, and the legacy redraw classifier can never treat a
+    // Compose redraw as animation-only, so the legacy path discards every frame and the recording
+    // stays blank. Route Compose-rooted windows onto the verified path, which compares real mask
+    // geometry, so pixel-only redraws survive.
+    private fun shouldVerifyMaskAlignment(
+        view: View,
+        drawState: WindowDrawState,
+    ): Boolean {
+        return config.sessionReplayConfig.verifyScreenshotMaskAlignment ||
+            view.isComposeRooted(drawState)
+    }
+
+    private fun View.isComposeRooted(drawState: WindowDrawState): Boolean {
+        drawState.composeRooted?.let { return it }
+        if (!isComposeAvailable) {
+            // Can never become true, so skip the main-thread hop entirely.
+            drawState.composeRooted = false
+            return false
+        }
+
+        if (!drawState.shouldRecheckComposeRoot(config.dateProvider.nanoTime())) {
+            return false
+        }
+
+        // The View hierarchy is main-thread-owned, so detection must run there: inline when
+        // already on it, otherwise post and wait, exactly like findMaskableComposeWidgets.
+        val rooted = runOnMainThreadBlocking { containsComposeView() }
+
+        // A swallowed failure cached as false would silently restore the every-frame-discard
+        // bug, so only a definite verdict is cached; "unknown" retries on the next draw.
+        if (rooted == null) {
+            drawState.clearComposeRootCheck()
+            return false
+        }
+        drawState.composeRooted = rooted
+        return rooted
+    }
+
+    // Scratch for the Compose-root walk; like the mask walks, it only runs on the main thread.
+    private val composeRootVisitedViews = IntHashSet()
+
+    private fun View.containsComposeView(): Boolean? {
+        return try {
+            composeRootVisitedViews.clear()
+            containsComposeView(composeRootVisitedViews)
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay Compose view detection failed: $e.")
+            null
+        }
+    }
+
+    private fun View.containsComposeView(visitedViews: IntHashSet): Boolean {
+        if (!visitedViews.add(System.identityHashCode(this))) {
+            return false
+        }
+        if (isComposeView()) {
+            return true
+        }
+        if (this is ViewGroup) {
+            for (i in 0 until childCount) {
+                if (getChildAt(i)?.containsComposeView(visitedViews) == true) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // Warns once after a run of discards so a silently blank recording stops being invisible.
+    private fun recordScreenshotDiscarded(drawState: WindowDrawState) {
+        if (drawState.recordScreenshotDiscard()) {
+            config.logger.log(
+                "Session Replay discarded several screenshots in a row during capture; the " +
+                    "recording may be blank. This can be caused by the screen changing during " +
+                    "capture, PixelCopy failing or timing out, or bitmap encoding failing.",
+            )
+        }
     }
 
     private val isComposeAvailable by lazy(LazyThreadSafetyMode.PUBLICATION) {
@@ -1397,11 +1475,12 @@ public class PostHogReplayIntegration(
     // attempt is thrown away and re-walked from scratch under a fresh capture, bounded so
     // a screen that redraws during every attempt discards instead of looping. Layout,
     // poison, and external invalidation discard immediately.
-    private fun armMaskCapture(
+    private fun runArmMaskCaptureLoop(
         view: View,
         drawState: WindowDrawState,
     ): ArmedMaskCapture? {
-        repeat(MAX_BASELINE_ARM_ATTEMPTS) {
+        var armed: ArmedMaskCapture? = null
+        for (attempt in 0 until MAX_BASELINE_ARM_ATTEMPTS) {
             val token = drawState.beginMaskCapture()
             val preWalk = MaskWalk()
             try {
@@ -1412,23 +1491,110 @@ public class PostHogReplayIntegration(
             }
             if (preWalk.poisoned) {
                 drawState.cancelMaskCapture(token)
-                return null
+                break
             }
             when (drawState.setBaseline(token, preWalk.rects)) {
-                BaselineResult.ARMED -> return ArmedMaskCapture(token, preWalk)
+                BaselineResult.ARMED -> {
+                    armed = ArmedMaskCapture(token, preWalk)
+                    break
+                }
                 BaselineResult.TORN_BY_DRAW -> drawState.cancelMaskCapture(token)
                 BaselineResult.UNKEEPABLE -> {
                     drawState.cancelMaskCapture(token)
-                    return null
+                    break
                 }
             }
         }
-        return null
+        return armed
     }
 
-    private fun Bitmap.paintScreenshotMasks(rects: List<Rect>): Boolean {
+    private fun armMaskCapture(
+        view: View,
+        drawState: WindowDrawState,
+    ): ArmedMaskCapture? {
+        // The whole loop runs in ONE main-thread message so a draw can't land between
+        // beginMaskCapture() and setBaseline() -- drawCount can't move mid-walk, which also makes
+        // TORN_BY_DRAW unreachable here; the retry stays as a guard if that ever changes. Nested
+        // run-on-main calls from the pre-walk (e.g. a ComposeView) run inline, already on main.
+        if (Looper.myLooper() == mainHandler.handler.looper) {
+            return try {
+                runArmMaskCaptureLoop(view, drawState)
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay main-thread hop failed: $e")
+                null
+            }
+        }
+
+        // Not the generic runOnMainThreadBlocking: on timeout the posted Runnable below still
+        // runs later and must not leave an armed capture nobody will ever consume. `claimed`
+        // makes the result claimable exactly once -- whichever side (the posted block finishing,
+        // or this waiter giving up) gets there first wins; the loser either returns null (waiter)
+        // or cancels its own token (block), so activeCapture is never left orphaned.
+        val latch = CountDownLatch(1)
+        val claimed = AtomicBoolean(false)
+        var result: ArmedMaskCapture? = null
+        mainHandler.handler.post {
+            try {
+                val armed = runArmMaskCaptureLoop(view, drawState)
+                // Publish before the CAS, not after: on timeout the waiter reads `result` only
+                // once its own CAS fails, and it is the CAS's volatile write that makes this
+                // assignment visible. Writing after would let the waiter observe a claimed
+                // capture with a still-null result and orphan it.
+                result = armed
+                if (!claimed.compareAndSet(false, true)) {
+                    armed?.let { drawState.cancelMaskCapture(it.token) }
+                }
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay main-thread hop failed: $e")
+            } finally {
+                latch.countDown()
+            }
+        }
+        return try {
+            if (latch.await(1000, TimeUnit.MILLISECONDS)) {
+                result
+            } else if (claimed.compareAndSet(false, true)) {
+                // We won the claim race; the block will see claimed == true and cancel.
+                null
+            } else {
+                // The block already claimed and published its result before we could -- safe to
+                // read after the failed CAS establishes happens-before.
+                result
+            }
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            config.logger.log("Session Replay main-thread hop failed: $e")
+            null
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay main-thread hop failed: $e")
+            null
+        }
+    }
+
+    internal fun RectF.setScaledScreenshotMask(
+        rect: Rect,
+        scaleX: Float,
+        scaleY: Float,
+    ) {
+        set(
+            floor(rect.left * scaleX),
+            floor(rect.top * scaleY),
+            ceil(rect.right * scaleX),
+            ceil(rect.bottom * scaleY),
+        )
+    }
+
+    private fun Bitmap.paintScreenshotMasks(
+        rects: List<Rect>,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        canPaintMask: () -> Boolean = { true },
+    ): Boolean {
         if (!isValid()) {
             this@PostHogReplayIntegration.config.logger.log("Session Replay Bitmap is invalid.")
+            return false
+        }
+        if (sourceWidth <= 0 || sourceHeight <= 0) {
             return false
         }
 
@@ -1440,10 +1606,15 @@ public class PostHogReplayIntegration(
                 return false
             }
 
+        val scaleX = width.toFloat() / sourceWidth
+        val scaleY = height.toFloat() / sourceHeight
         val maskRect = RectF()
-        rects.forEach {
-            maskRect.set(it)
-            canvas.drawRoundRect(maskRect, 10f, 10f, paint)
+        for (rect in rects) {
+            if (!canPaintMask()) {
+                return false
+            }
+            maskRect.setScaledScreenshotMask(rect, scaleX, scaleY)
+            canvas.drawRoundRect(maskRect, 10f * scaleX, 10f * scaleY, paint)
         }
         return true
     }
@@ -1452,7 +1623,12 @@ public class PostHogReplayIntegration(
         bitmap: Bitmap,
         drawState: WindowDrawState,
         armedCapture: ArmedMaskCapture,
+        sourceWidth: Int,
+        sourceHeight: Int,
     ): Boolean {
+        if (width != sourceWidth || height != sourceHeight) {
+            return false
+        }
         val postWalk = MaskWalk()
         // A layout pass or an invalidating draw sample already sealed the verdict as discard,
         // so the post-copy walk would be wasted work.
@@ -1467,19 +1643,26 @@ public class PostHogReplayIntegration(
                 postWalk.rects,
                 postWalk.poisoned,
             )
-        if (!captureAligned || !shouldKeepFrame(drawState, armedCapture.preWalk, postWalk)) {
+        if (width != sourceWidth || height != sourceHeight ||
+            !captureAligned || !shouldKeepFrame(drawState, armedCapture.preWalk, postWalk)
+        ) {
             // Masks may be out of sync with the pixels, discard to avoid a PII leak.
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             return false
         }
-        return bitmap.paintScreenshotMasks(postWalk.rects)
+        return bitmap.paintScreenshotMasks(postWalk.rects, sourceWidth, sourceHeight)
     }
 
     private fun View.maskLegacyScreenshot(
         bitmap: Bitmap,
         drawState: WindowDrawState,
+        sourceWidth: Int,
+        sourceHeight: Int,
     ): Boolean {
-        val unsafeRedraw = { drawState.isOnDrawnCalled && !drawState.isOnlyAnimationRedraw }
+        val unsafeRedraw = {
+            width != sourceWidth || height != sourceHeight ||
+                (drawState.isOnDrawnCalled && !drawState.isOnlyAnimationRedraw)
+        }
         if (unsafeRedraw()) {
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             return false
@@ -1492,28 +1675,60 @@ public class PostHogReplayIntegration(
             return false
         }
 
-        if (!bitmap.isValid()) {
-            config.logger.log("Session Replay Bitmap is invalid.")
-            return false
-        }
-        val canvas =
-            try {
-                Canvas(bitmap)
-            } catch (e: Throwable) {
-                config.logger.log("Session Replay Canvas creation failed: $e.")
-                return false
-            }
-        val maskRect = RectF()
-        walk.rects.forEach {
-            if (unsafeRedraw()) {
+        return bitmap.paintScreenshotMasks(walk.rects, sourceWidth, sourceHeight) {
+            val safe = !unsafeRedraw()
+            if (!safe) {
                 config.logger.log("Session Replay screenshot discarded due to screen changes.")
+            }
+            safe
+        }
+    }
+
+    private class PixelCopyRequestState {
+        private var callbackFinished = false
+        private var waiterAbandoned = false
+        private var copySucceeded = false
+
+        @Synchronized
+        fun isAbandoned(): Boolean = waiterAbandoned
+
+        @Synchronized
+        fun complete(succeeded: Boolean): Boolean {
+            if (callbackFinished) {
                 return false
             }
-            maskRect.set(it)
-            canvas.drawRoundRect(maskRect, 10f, 10f, paint)
+            copySucceeded = succeeded
+            callbackFinished = true
+            return waiterAbandoned
         }
-        return true
+
+        @Synchronized
+        fun abandon(): Boolean {
+            waiterAbandoned = true
+            return callbackFinished
+        }
+
+        @Synchronized
+        fun succeeded(): Boolean = callbackFinished && copySucceeded
     }
+
+    private fun finishScreenshotCapture(
+        drawState: WindowDrawState,
+        armedCapture: ArmedMaskCapture?,
+        verifyMaskAlignment: Boolean,
+    ) {
+        armedCapture?.let { drawState.cancelMaskCapture(it.token) }
+        if (verifyMaskAlignment) {
+            drawState.reset()
+        } else {
+            drawState.finishLegacyCapture()
+        }
+    }
+
+    private fun scaledScreenshotDimension(
+        size: Int,
+        scale: Float,
+    ): Int = maxOf(1, ceil(size * scale).toInt())
 
     // PixelCopy is only API >= 24 but this is already protected by the isSupported method
     @SuppressLint("NewApi")
@@ -1538,11 +1753,20 @@ public class PostHogReplayIntegration(
         }
         val x = coordinates[0].densityValue(screenDensity)
         val y = coordinates[1].densityValue(screenDensity)
-        val width = view.width.densityValue(screenDensity)
-        val height = view.height.densityValue(screenDensity)
+        val sourceWidth = view.width
+        val sourceHeight = view.height
+        val width = sourceWidth.densityValue(screenDensity)
+        val height = sourceHeight.densityValue(screenDensity)
+        val screenshotScale = config.sessionReplayConfig.screenshotScale
+        val compressionQuality = config.sessionReplayConfig.screenshotCompressionQuality
+        val bitmapConfig =
+            when (config.sessionReplayConfig.screenshotColorMode) {
+                PostHogScreenshotColorMode.ARGB_8888 -> Bitmap.Config.ARGB_8888
+                PostHogScreenshotColorMode.RGB_565 -> Bitmap.Config.RGB_565
+            }
         var base64: String? = null
 
-        val verifyMaskAlignment = config.sessionReplayConfig.verifyScreenshotMaskAlignment
+        val verifyMaskAlignment = shouldVerifyMaskAlignment(view, drawState)
         val armedCapture =
             if (verifyMaskAlignment) {
                 drawState.reset()
@@ -1555,80 +1779,132 @@ public class PostHogReplayIntegration(
             }
         if (verifyMaskAlignment && armedCapture == null) {
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
+            recordScreenshotDiscarded(drawState)
             return null
         }
-        val bitmap: Bitmap
+
+        if (sourceWidth <= 0 || sourceHeight <= 0 || view.width != sourceWidth || view.height != sourceHeight) {
+            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+            recordScreenshotDiscarded(drawState)
+            return null
+        }
+        val bitmapLease: PixelCopyBitmapBuffer.Lease
         val handler: Handler
         try {
-            bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
             handler = ensurePixelCopyHandler()
+            bitmapLease =
+                pixelCopyBitmapBuffer.acquire(
+                    scaledScreenshotDimension(sourceWidth, screenshotScale),
+                    scaledScreenshotDimension(sourceHeight, screenshotScale),
+                    bitmapConfig,
+                ) ?: run {
+                    finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+                    recordScreenshotDiscarded(drawState)
+                    return null
+                }
         } catch (e: Throwable) {
-            armedCapture?.let { drawState.cancelMaskCapture(it.token) }
-            if (verifyMaskAlignment) {
-                drawState.reset()
-            } else {
-                drawState.finishLegacyCapture()
-            }
+            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
             config.logger.log("Session Replay screenshot setup failed: $e.")
+            recordScreenshotDiscarded(drawState)
             return null
         }
 
+        val bitmap = bitmapLease.bitmap
         val latch = CountDownLatch(1)
-        var success = true
+        val requestState = PixelCopyRequestState()
 
-        // Track whether the PixelCopy callback has finished to avoid recycling the bitmap
-        // while the callback is still using it (e.g. if latch.await times out).
-        // We use the latch itself as the synchronization mechanism (await happens-before countDown)
-        var callbackCompleted = false
-
+        drawState.beginPixelCopy()
         try {
-            PixelCopy.request(window, bitmap, { copyResult ->
-                try {
-                    if (copyResult != PixelCopy.SUCCESS) {
-                        config.logger.log("Session Replay PixelCopy failed: $copyResult.")
-                        success = false
-                    } else {
-                        success =
-                            if (armedCapture != null) {
-                                view.maskVerifiedScreenshot(bitmap, drawState, armedCapture)
-                            } else {
-                                view.maskLegacyScreenshot(bitmap, drawState)
+            PixelCopy.request(
+                window,
+                bitmap,
+                { copyResult ->
+                    var succeeded = false
+                    try {
+                        if (copyResult != PixelCopy.SUCCESS) {
+                            if (
+                                copyResult == PixelCopy.ERROR_DESTINATION_INVALID &&
+                                bitmap.config == Bitmap.Config.RGB_565 &&
+                                pixelCopyBitmapBuffer.fallbackToArgb8888()
+                            ) {
+                                config.logger.log(
+                                    "Session Replay PixelCopy does not support RGB_565; falling back to ARGB_8888.",
+                                )
                             }
+                            config.logger.log("Session Replay PixelCopy failed: $copyResult.")
+                        } else if (!requestState.isAbandoned()) {
+                            succeeded =
+                                if (armedCapture != null) {
+                                    view.maskVerifiedScreenshot(bitmap, drawState, armedCapture, sourceWidth, sourceHeight)
+                                } else {
+                                    view.maskLegacyScreenshot(bitmap, drawState, sourceWidth, sourceHeight)
+                                }
+                        }
+                    } catch (e: Throwable) {
+                        config.logger.log("Session Replay PixelCopy failed: $e.")
+                    } finally {
+                        val releaseInCallback = requestState.complete(succeeded)
+                        try {
+                            if (releaseInCallback) {
+                                bitmapLease.release()
+                            }
+                        } finally {
+                            drawState.finishPixelCopy()
+                            latch.countDown()
+                        }
                     }
-                } catch (e: Throwable) {
-                    config.logger.log("Session Replay PixelCopy failed: $e.")
-                    success = false
-                } finally {
-                    callbackCompleted = true
-                    latch.countDown()
-                }
-            }, handler)
+                },
+                handler,
+            )
         } catch (e: Throwable) {
             config.logger.log("Session Replay PixelCopy failed: $e.")
-            success = false
-            callbackCompleted = true
-            latch.countDown()
+            try {
+                if (requestState.complete(false)) {
+                    bitmapLease.release()
+                }
+            } finally {
+                drawState.finishPixelCopy()
+                latch.countDown()
+            }
         }
 
+        var releaseFromWaiter = false
+        val callbackFinished =
+            try {
+                latch.await(1000, TimeUnit.MILLISECONDS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                config.logger.log("Session Replay PixelCopy wait interrupted: $e.")
+                releaseFromWaiter = requestState.abandon()
+                null
+            } catch (e: Throwable) {
+                config.logger.log("Session Replay PixelCopy wait failed: $e.")
+                releaseFromWaiter = requestState.abandon()
+                null
+            }
+
         try {
-            // On timeout the masks aren't painted yet, so the bitmap must not be shipped.
-            if (latch.await(1000, TimeUnit.MILLISECONDS) && success) {
-                base64 = bitmap.webpBase64()
+            when (callbackFinished) {
+                true -> {
+                    releaseFromWaiter = true
+                    if (requestState.succeeded()) {
+                        try {
+                            base64 = bitmap.webpBase64(compressionQuality)
+                        } catch (e: Throwable) {
+                            config.logger.log("Session Replay screenshot encoding failed: $e.")
+                        }
+                    }
+                }
+                false -> {
+                    config.logger.log("Session Replay PixelCopy timed out.")
+                    releaseFromWaiter = requestState.abandon()
+                }
+                null -> Unit
             }
-        } catch (e: Throwable) {
-            config.logger.log("Session Replay PixelCopy timed out: $e.")
         } finally {
-            armedCapture?.let { drawState.cancelMaskCapture(it.token) }
-            if (verifyMaskAlignment) {
-                drawState.reset()
-            } else {
-                drawState.finishLegacyCapture()
-            }
-            // Only recycle the bitmap if the callback has completed.
-            // If the latch timed out, the PixelCopy callback may still be writing to the bitmap
-            // on another thread; recycling it now would cause a native SIGSEGV.
-            if (callbackCompleted && !bitmap.isRecycled) {
-                bitmap.recycle()
+            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+            if (releaseFromWaiter) {
+                bitmapLease.release()
             }
         }
 
@@ -1638,8 +1914,10 @@ public class PostHogReplayIntegration(
         // renders as its placeholder tile — a visible flash. Skip the frame
         // instead; the caller retries on the next capture.
         if (base64 == null) {
+            recordScreenshotDiscarded(drawState)
             return null
         }
+        drawState.resetScreenshotDiscards()
 
         return RRWireframe(
             id = viewId,
@@ -2088,7 +2366,10 @@ public class PostHogReplayIntegration(
         return result
     }
 
-    private fun findAddedAndRemovedItems(
+    // internal (not private) so tests can drive the diff with synthetic trees --
+    // the sniff-window guard is a property of this function's output alone and
+    // needs no device, views or Robolectric window plumbing to pin.
+    internal fun findAddedAndRemovedItems(
         oldItems: List<RRWireframe>,
         newItems: List<RRWireframe>,
     ): Triple<List<RRWireframe>, List<RRWireframe>, List<RRWireframe>> {
@@ -2125,6 +2406,72 @@ public class PostHogReplayIntegration(
             }
         }
 
+        return avoidScreenshotMisdetection(addedItems, removedItems, updatedItems, newItems, oldItemIds)
+    }
+
+    /**
+     * Keep an <img> out of the first three adds of a mutation.
+     *
+     * The web player classifies a mutation by peeking at its first THREE adds
+     * (posthog/common/replay-shared/src/snapshot-processing/process-all-snapshots.ts,
+     * extractImgNodeFromMobileIncremental -> Math.min(adds.length, 3)). If any is
+     * an <img> with data-rrweb-id + width + height, isLikelyMobileScreenshot
+     * declares the mutation a screenshot, synthesizes a full snapshot holding ONLY
+     * that image, and pushes it -- replacing the whole replayed document with
+     * <html><head><body><img>.
+     *
+     * In wireframe mode that is wrong: these images are 16-32px ICONS. The player
+     * then shows one icon alone on a blank page, which reads as a white screen.
+     *
+     * The sniff only reads indices 0..2, so three non-image nodes in front avoid
+     * it. When an image would land there, remove a live ancestor and re-add its
+     * subtree, whose containers precede the image. rrweb applies removes before
+     * adds, so remove+re-add is self-consistent.
+     */
+    private fun avoidScreenshotMisdetection(
+        addedItems: List<RRWireframe>,
+        removedItems: List<RRWireframe>,
+        updatedItems: List<RRWireframe>,
+        newItems: List<RRWireframe>,
+        liveIds: Set<Int>,
+    ): Triple<List<RRWireframe>, List<RRWireframe>, List<RRWireframe>> {
+        // Mirror how the player flattens: each emitted wireframe contributes
+        // itself then its children, pre-order; updates are appended after adds.
+        fun preorder(node: RRWireframe): List<RRWireframe> {
+            val out = mutableListOf<RRWireframe>()
+            fun visit(n: RRWireframe) {
+                out.add(n)
+                n.childWireframes?.forEach(::visit)
+            }
+            visit(node)
+            return out
+        }
+        fun isImage(w: RRWireframe) = w.type == "image" || w.type == "screenshot"
+
+        val projected = addedItems.flatMap(::preorder) + updatedItems.flatMap(::preorder)
+        val offender = projected.take(3).firstOrNull(::isImage)
+            ?: return Triple(addedItems, removedItems, updatedItems)
+
+        val parentOf = newItems.associate { it.id to it.parentId }
+        val newMap = newItems.associateBy { it.id }
+
+        var candidate = parentOf[offender.id]
+        val guard = HashSet<Int>()
+        while (candidate != null && guard.add(candidate)) {
+            val node = newMap[candidate]
+            if (node != null && candidate in liveIds) {
+                val sub = preorder(node)
+                if (sub.takeWhile { !isImage(it) }.size >= 3) {
+                    val subIds = sub.mapTo(HashSet()) { it.id }
+                    return Triple(
+                        listOf(node) + addedItems.filter { it.id !in subIds },
+                        removedItems + node,
+                        updatedItems.filter { it.id !in subIds },
+                    )
+                }
+            }
+            candidate = parentOf[candidate]
+        }
         return Triple(addedItems, removedItems, updatedItems)
     }
 
@@ -2188,7 +2535,17 @@ public class PostHogReplayIntegration(
     }
 
     override fun start(resumeCurrent: Boolean) {
-        // Check if we should wait for event triggers before starting
+        // Remember an explicit start asked for while automatic replay is off. The event gate can
+        // defer it, so the intent must be recorded before checking that gate.
+        if (!config.sessionReplay) {
+            startedWithAutomaticDisabled = true
+        }
+
+        startRecording(resumeCurrent)
+    }
+
+    private fun startRecording(resumeCurrent: Boolean) {
+        // Event triggers may change while an automatic start is queued on main.
         if (shouldWaitForEventTriggers()) {
             val triggers = config.remoteConfigHolder?.getEventTriggers()
             config.logger.log(
@@ -2200,9 +2557,13 @@ public class PostHogReplayIntegration(
         val currentSessionId = postHog?.getSessionId()?.toString()
         resetSessionStateIfNeeded(currentSessionId, force = !resumeCurrent)
 
-        // Automatic setup never starts while this setting is false. A start in that state comes
-        // from the manual API or an event trigger and must survive automatic-start checks.
-        recordingState = if (config.sessionReplay) RecordingState.AUTOMATIC else RecordingState.MANUAL
+        // Keep producer commits and the bitmap buffer lifecycle on the same recording run.
+        synchronized(pixelCopyBitmapBuffer) {
+            synchronized(decorViews) {
+                pixelCopyBitmapBuffer.open()
+                isSessionReplayActive = true
+            }
+        }
 
         if (!resumeCurrent) {
             // Without this, on a static UI the first user-driven onDraw can be tens of seconds
@@ -2219,18 +2580,28 @@ public class PostHogReplayIntegration(
     private fun clearSnapshotStates() {
         // clear state so it starts with a full snapshot again
         synchronized(decorViews) {
+            snapshotGeneration++
             decorViews.entries.forEach {
                 resetViewSnapshotStates(it.value)
             }
         }
-        // Drop document ownership too, so the next capture re-anchors with a fresh full (GAME-1236).
-        currentDocumentOwner = null
     }
 
     override fun stop() {
-        recordingState = RecordingState.INACTIVE
-        synchronized(decorViews) {
-            decorViews.values.forEach { it.drawState.invalidateMaskCapture() }
+        stopRecording(resetManualStart = true)
+    }
+
+    private fun stopRecording(resetManualStart: Boolean = false) {
+        synchronized(pixelCopyBitmapBuffer) {
+            synchronized(decorViews) {
+                if (resetManualStart) {
+                    startedWithAutomaticDisabled = false
+                }
+                isSessionReplayActive = false
+                snapshotGeneration++
+                pixelCopyBitmapBuffer.close()
+                decorViews.values.forEach { it.drawState.invalidateMaskCapture() }
+            }
         }
     }
 
@@ -2240,7 +2611,7 @@ public class PostHogReplayIntegration(
 
     /**
      * Called when an event is captured. Checks if the event matches any configured triggers
-     * and starts session recording if so.
+     * and starts session recording if so, provided the other gates permit the session.
      */
     override fun onEvent(
         event: String,
@@ -2268,9 +2639,17 @@ public class PostHogReplayIntegration(
             synchronized(eventTriggersLock) {
                 triggerActivatedSessionId = currentSessionId
             }
+            // A matched trigger only lifts the event-trigger gate. The master switch, the project
+            // flag and the sampling decision still decide, as on every other automatic start path.
+            if (!isRecordingPermittedForCurrentSession()) {
+                config.logger.log(
+                    "[Session Replay] Event trigger matched: $event, but recording is not permitted for session $currentSessionId.",
+                )
+                return
+            }
             config.logger.log("[Session Replay] Event trigger matched: $event. Starting replay for session $currentSessionId.")
-            // Start the integration now that a trigger has matched
-            start(resumeCurrent = true)
+            // Do not call start(): only an explicit request may establish manual-start provenance.
+            startRecording(resumeCurrent = true)
         }
     }
 
@@ -2285,6 +2664,8 @@ public class PostHogReplayIntegration(
         // Read-only: getActiveSessionId() can rotate the session and would re-fire this listener.
         val currentSessionId = PostHogSessionManager.peekSessionId()?.toString()
 
+        // Invalidate immediately; reinitialization may be queued behind UI work.
+        if (replaySessionId != currentSessionId) stopRecording()
         resetSessionStateIfNeeded(currentSessionId)
 
         val remoteConfig = config.remoteConfigHolder
@@ -2295,17 +2676,17 @@ public class PostHogReplayIntegration(
         if (!triggers.isNullOrEmpty() && activatedSession != currentSessionId) {
             if (isSessionReplayActive) {
                 config.logger.log("[Session Replay] Session changed. Stopping until trigger is matched.")
-                stop()
+                stopRecording()
             }
             return
         }
 
-        // The listener can fire from any thread that calls capture(); replay state writes
-        // (snapshot WeakHashMap, isSessionReplayActive) must happen on main.
+        // The listener can fire from any thread that calls capture(); automatic restarts
+        // are scheduled on main, after the synchronous producer invalidation above.
         if (currentSessionId == null) {
             if (isSessionReplayActive) {
                 config.logger.log("[Session Replay] Session cleared. Stopping recording.")
-                mainHandler.handler.post { stop() }
+                mainHandler.handler.post { stopRecording() }
             }
             return
         }
@@ -2316,22 +2697,23 @@ public class PostHogReplayIntegration(
         // rotated; going through PostHog.startSessionReplay(false) would double-rotate).
         config.logger.log("[Session Replay] Session changed. Re-initializing recording for new session.")
         mainHandler.handler.post {
-            // config.sessionReplay controls automatic starts. An active replay may have been
-            // started manually, so preserve it across rotation even when automatic replay is off.
-            if (!config.sessionReplay && !isManualSessionReplayActive) {
-                if (isSessionReplayActive) stop()
+            // config.sessionReplay controls automatic starts. A recording started while it was
+            // off must survive rotation, so it is preserved here too.
+            if (!config.sessionReplay && !startedWithAutomaticDisabled) {
+                if (isSessionReplayActive) stopRecording()
                 return@post
             }
             if (remoteConfig?.isSessionReplayFlagActive() != true) {
-                if (isSessionReplayActive) stop()
+                if (isSessionReplayActive) stopRecording()
                 return@post
             }
             if (remoteConfig.makeSamplingDecision(currentSessionId).not()) {
-                if (isSessionReplayActive) stop()
+                if (isSessionReplayActive) stopRecording()
                 return@post
             }
-            if (isSessionReplayActive) stop()
-            start(resumeCurrent = false)
+            if (isSessionReplayActive) stopRecording()
+            // Do not call start(): session rotation is an automatic transition.
+            startRecording(resumeCurrent = false)
         }
     }
 
@@ -2363,8 +2745,10 @@ public class PostHogReplayIntegration(
             return
         }
 
-        replaySessionId = currentSessionId
-        clearSnapshotStates()
+        synchronized(decorViews) {
+            replaySessionId = currentSessionId
+            clearSnapshotStates()
+        }
         resetBufferingState()
     }
 
@@ -2402,37 +2786,6 @@ public class PostHogReplayIntegration(
         }
 
         migrateBufferIfMinimumDurationMet(replayQueue)
-    }
-
-    /**
-     * Re-anchor after the buffer was dropped ([PostHogReplayQueue.clearBuffer]).
-     *
-     * The drop discarded any buffered FULL snapshot, but per-view snapshot state still says a full
-     * was sent, so a still-active (or about-to-resume) recording would keep emitting INCREMENTAL
-     * mutations the player can't anchor — the GAME-1236 blank/white screen. Clearing the per-view
-     * state forces the next capture to be a fresh meta + full snapshot; the redraw kicks that
-     * capture promptly on an otherwise static screen (the landing after export), rather than
-     * waiting for the next user-driven onDraw.
-     *
-     * Scheduled on the snapshot executor so the state reset is ordered against generateSnapshot
-     * (which runs there too) — the reset lands before the next capture instead of racing it. The
-     * redraw is posted to the main thread, as View.postInvalidate requires. Both are safe when
-     * recording is inactive: the reset only affects the next capture, and a redraw whose snapshot
-     * finds recording stopped self-drops.
-     */
-    private fun onReplayBufferCleared() {
-        try {
-            executor.submit {
-                clearSnapshotStates()
-            }
-        } catch (e: Throwable) {
-            config.logger.log("Session Replay re-anchor after buffer clear failed: $e.")
-        }
-        mainHandler.handler.post {
-            synchronized(decorViews) {
-                decorViews.keys.forEach { it.postInvalidate() }
-            }
-        }
     }
 
     /**
@@ -2552,7 +2905,7 @@ public class PostHogReplayIntegration(
             // Self-gate the capturer first so no new snapshot re-enters the buffer, then drop the
             // buffer, and only then disarm — an in-flight add() checks isBuffering and enqueues in
             // separate steps, so it could otherwise route a stale snapshot past the disarm.
-            stop()
+            stopRecording()
             replayQueue?.clearBuffer()
             synchronized(bufferingLock) {
                 if (bufferingGeneration == generation) {
@@ -2571,7 +2924,7 @@ public class PostHogReplayIntegration(
      */
     private fun isRecordingPermittedForCurrentSession(): Boolean {
         val remoteConfig = config.remoteConfigHolder ?: return false
-        if ((!config.sessionReplay && !isManualSessionReplayActive) || !remoteConfig.isSessionReplayFlagActive()) {
+        if ((!config.sessionReplay && !startedWithAutomaticDisabled) || !remoteConfig.isSessionReplayFlagActive()) {
             return false
         }
         if (shouldWaitForEventTriggers()) {
@@ -2596,7 +2949,7 @@ public class PostHogReplayIntegration(
         val postHog = this.postHog ?: return
         val remoteConfig = config.remoteConfigHolder ?: return
 
-        if ((!config.sessionReplay && !isManualSessionReplayActive) || !remoteConfig.isSessionReplayFlagActive()) {
+        if ((!config.sessionReplay && !startedWithAutomaticDisabled) || !remoteConfig.isSessionReplayFlagActive()) {
             if (!isFirstDelivery) {
                 stopIfActive("Remote config disabled recording. Stopping.")
             }
@@ -2616,15 +2969,16 @@ public class PostHogReplayIntegration(
         if (!isSessionReplayActive) {
             config.logger.log("[Session Replay] Remote config enabled recording. Resuming.")
             mainHandler.handler.post {
-                if (!isSessionReplayActive) {
+                // Re-check at the transition so a queued automatic resume cannot use stale gates.
+                if (!isSessionReplayActive && isRecordingPermittedForCurrentSession()) {
                     // Force a fresh keyframe for the resumed segment. While stopped, per-view snapshot
                     // state is frozen and can reference a full snapshot that was never delivered (e.g. a
                     // first-config-off opening window that was dropped), so resuming against it would emit
                     // orphaned incremental snapshots the player can't anchor. Clear the state and force a
                     // redraw so the resumed segment starts with meta + full snapshot — without rotating the
-                    // session or touching the cold-start buffering state (unlike start(resumeCurrent = false)).
+                    // session or touching the cold-start buffering state (unlike startRecording(false)).
                     clearSnapshotStates()
-                    start(resumeCurrent = true)
+                    startRecording(resumeCurrent = true)
                     synchronized(decorViews) {
                         decorViews.keys.forEach { it.postInvalidate() }
                     }
@@ -2636,11 +2990,9 @@ public class PostHogReplayIntegration(
     private fun stopIfActive(reason: String) {
         if (isSessionReplayActive) {
             config.logger.log("[Session Replay] $reason")
-            // Flip the active gate synchronously so a concurrent add() on the replay executor stops
-            // persisting immediately (PostHogReplayQueue.shouldPersist reads isActive), instead of
-            // leaking snapshots to the send queue in the window before the posted stop() runs on main.
-            recordingState = RecordingState.INACTIVE
-            mainHandler.handler.post { stop() }
+            // Invalidate both the producer lease and queue persistence synchronously.
+            // Posting the stop would leave in-flight frames eligible until main runs it.
+            stopRecording()
         }
     }
 
@@ -2695,18 +3047,5 @@ public class PostHogReplayIntegration(
         private const val MAX_BASELINE_ARM_ATTEMPTS: Int = 3
 
         private val integrationInstalled = AtomicBoolean(false)
-
-        // GAME-1236 / posthog-android#752 — the minimum wireframe node count a decor view
-        // must have to be captured in wireframe mode. A real content screen has 20-250
-        // nodes; the editor library's lone-image selection/drag overlays (and stripped
-        // system-bar roots) have ~1. This floor sits well above the overlays and well below
-        // any real screen, and unlike a size threshold it catches a full-screen drag layer.
-        private const val MIN_CONTENT_WINDOW_NODES: Int = 12
-
-        // Minimum wireframe height (dp) for a decor view to count as a full-screen content
-        // window. Content screens here are ~850dp tall; modal dialogs are <=~280dp, so this
-        // floor drops floating dialogs while leaving every real screen (and the ~777dp system
-        // share sheet) captured.
-        private const val MIN_FULLSCREEN_HEIGHT_DP: Int = 500
     }
 }

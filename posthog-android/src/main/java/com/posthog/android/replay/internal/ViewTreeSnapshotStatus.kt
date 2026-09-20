@@ -3,6 +3,11 @@ package com.posthog.android.replay.internal
 import android.graphics.Rect
 import android.view.ViewTreeObserver
 import com.posthog.internal.replay.RRWireframe
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+
+private const val CONSECUTIVE_DISCARD_WARNING_THRESHOLD: Int = 3
+private const val COMPOSE_ROOT_RECHECK_INTERVAL_NANOS: Long = 1_000_000_000
 
 // if you add any new property, remember to clear the state from resetViewSnapshotStates
 internal class ViewTreeSnapshotStatus(
@@ -63,9 +68,91 @@ internal class WindowDrawState {
     var isLegacyCaptureActive: Boolean = false
         private set
 
+    // Whether this window's view tree is rooted in Jetpack Compose. Detected once from the tree,
+    // then cached, so the redraw handling does not re-walk the tree on every draw.
+    @Volatile
+    var composeRooted: Boolean? = null
+
+    @Volatile
+    private var lastComposeRootCheckNanos: Long = 0
+
+    // A "not Compose" verdict is cleared by every layout pass so lazily mounted Compose is still
+    // picked up, but the check walks the whole view tree, so rate-limit it rather than re-walking
+    // on the first draw after every layout.
+    fun shouldRecheckComposeRoot(nowNanos: Long): Boolean {
+        if (lastComposeRootCheckNanos != 0L &&
+            nowNanos - lastComposeRootCheckNanos < COMPOSE_ROOT_RECHECK_INTERVAL_NANOS
+        ) {
+            return false
+        }
+        lastComposeRootCheckNanos = nowNanos
+        return true
+    }
+
+    // An indefinite verdict must not spend the re-check budget: it stays uncached and retries on
+    // the next draw.
+    fun clearComposeRootCheck() {
+        lastComposeRootCheckNanos = 0
+    }
+
+    // Screenshots discarded in a row for mask safety. Incremented from the capture executor
+    // thread and the PixelCopy callback thread, reset from the main thread — plain @Volatile
+    // doesn't make `+1` atomic across those writers, hence AtomicInteger.
+    private val consecutiveScreenshotDiscards = AtomicInteger(0)
+
+    // Cleared alongside the counter so the warning fires once per run of discards, not once
+    // per session and not on every discard past the threshold.
+    private val discardWarningFired = AtomicBoolean(false)
+
+    // Increments the discard streak and returns true exactly once per run — when the streak
+    // first reaches (or, after a lost increment, jumps past) the warning threshold.
+    fun recordScreenshotDiscard(): Boolean {
+        val discards = consecutiveScreenshotDiscards.incrementAndGet()
+        return discards >= CONSECUTIVE_DISCARD_WARNING_THRESHOLD && discardWarningFired.compareAndSet(false, true)
+    }
+
+    fun resetScreenshotDiscards() {
+        consecutiveScreenshotDiscards.set(0)
+        discardWarningFired.set(false)
+    }
+
+    fun resetSnapshotState() {
+        composeRooted = null
+        lastComposeRootCheckNanos = 0
+        resetScreenshotDiscards()
+        invalidateMaskCapture()
+    }
+
     private val captureLock = Any()
     private var nextCaptureId: Long = 0
     private var activeCapture: ActiveMaskCapture? = null
+
+    // Independent of mask/snapshot resets: stopping or rotating a session must not allow
+    // another task while the old worker or a timed-out PixelCopy callback is still running.
+    private var captureScheduled = false
+    private var pixelCopyInFlight = false
+
+    fun tryScheduleCapture(): Boolean =
+        synchronized(captureLock) {
+            if (captureScheduled || pixelCopyInFlight) {
+                false
+            } else {
+                captureScheduled = true
+                true
+            }
+        }
+
+    fun finishScheduledCapture() {
+        synchronized(captureLock) { captureScheduled = false }
+    }
+
+    fun beginPixelCopy() {
+        synchronized(captureLock) { pixelCopyInFlight = true }
+    }
+
+    fun finishPixelCopy() {
+        synchronized(captureLock) { pixelCopyInFlight = false }
+    }
 
     fun reset() {
         isOnDrawnCalled = false
@@ -174,6 +261,12 @@ internal class WindowDrawState {
 
     fun recordLayout() {
         didLayoutSinceReset = true
+        // Compose can be mounted lazily, so a "not Compose" verdict must be re-checked after a
+        // layout. A "Compose" verdict never needs re-checking: the window simply stays on the
+        // verified path (the safe direction), avoiding a tree re-walk on every layout pass.
+        if (composeRooted == false) {
+            composeRooted = null
+        }
         synchronized(captureLock) {
             activeCapture?.invalid = true
         }

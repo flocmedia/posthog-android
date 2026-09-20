@@ -3,20 +3,26 @@ package com.posthog.android.replay
 import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.Point
 import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.drawable.BitmapDrawable
 import android.os.Handler
 import android.os.Looper
+import android.util.Base64
 import android.view.MotionEvent
 import android.view.PixelCopy
 import android.view.View
 import android.view.Window
+import android.view.WindowManager
 import android.view.animation.Animation
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.posthog.PostHog
 import com.posthog.PostHogEvent
 import com.posthog.PostHogFake
 import com.posthog.PostHogInterface
@@ -24,7 +30,9 @@ import com.posthog.android.API_KEY
 import com.posthog.android.PostHogAndroidConfig
 import com.posthog.android.createPostHogFake
 import com.posthog.android.internal.MainHandler
+import com.posthog.android.internal.webpBase64
 import com.posthog.android.replay.internal.NextDrawListener
+import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.internal.EndpointSpec
@@ -39,21 +47,40 @@ import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogRemoteConfig
 import com.posthog.internal.PostHogSessionManager
+import com.posthog.internal.replay.RREvent
+import com.posthog.internal.replay.RREventType
+import com.posthog.internal.replay.RRFullSnapshotEvent
+import com.posthog.internal.replay.RRIncrementalMouseInteractionData
+import com.posthog.internal.replay.RRIncrementalMouseInteractionEvent
+import com.posthog.internal.replay.RRMetaEvent
+import com.posthog.internal.replay.RRMouseInteraction
+import com.posthog.internal.replay.RRWireframe
+import curtains.Curtains
 import curtains.DispatchState
+import curtains.OnRootViewsChangedListener
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import org.junit.runner.RunWith
+import org.mockito.MockedStatic
+import org.mockito.Mockito.mockStatic
 import org.mockito.kotlin.any
 import org.mockito.kotlin.doReturn
 import org.mockito.kotlin.mock
 import org.mockito.kotlin.whenever
+import org.robolectric.ParameterizedRobolectricTestRunner
+import org.robolectric.ParameterizedRobolectricTestRunner.Parameters
 import org.robolectric.Robolectric
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 import org.robolectric.annotation.Implementation
 import org.robolectric.annotation.Implements
+import org.robolectric.annotation.LooperMode
+import org.robolectric.shadows.ShadowLegacyBitmap
 import org.robolectric.shadows.ShadowPixelCopy
+import org.robolectric.util.ReflectionHelpers
 import java.lang.ref.WeakReference
+import java.util.Collections
 import java.util.Date
 import java.util.UUID
 import java.util.concurrent.Callable
@@ -61,10 +88,15 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.FutureTask
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.jvm.functions.Function0
+import kotlin.math.ceil
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -106,9 +138,6 @@ internal class PostHogReplayIntegrationTest {
 
         override fun onReplayBufferSnapshot(replayQueue: PostHogReplayQueue) {
         }
-
-        override fun onBufferCleared() {
-        }
     }
 
     private class RecordingLogger : PostHogLogger {
@@ -139,6 +168,8 @@ internal class PostHogReplayIntegrationTest {
 
     @AfterTest
     fun `tear down`() {
+        // Flush listener removals posted by uninstall before Robolectric resets the main looper.
+        shadowOf(Looper.getMainLooper()).idle()
         PostHogSessionManager.isReactNative = false
         PostHogSessionManager.endSession()
         PostHogSessionManager.setAppInBackground(true)
@@ -185,12 +216,13 @@ internal class PostHogReplayIntegrationTest {
         flagActive: Boolean,
         samplingPasses: Boolean,
         sessionReplay: Boolean = true,
+        triggers: Set<String> = emptySet(),
     ): PostHogAndroidConfig {
         val remoteConfig =
             mock<PostHogRemoteConfig> {
                 on { isSessionReplayFlagActive() } doReturn flagActive
                 on { makeSamplingDecision(any()) } doReturn samplingPasses
-                on { getEventTriggers() } doReturn emptySet<String>()
+                on { getEventTriggers() } doReturn triggers
                 on { hasRemoteConfigFetched() } doReturn true
             }
         return PostHogAndroidConfig(API_KEY).apply {
@@ -223,6 +255,144 @@ internal class PostHogReplayIntegrationTest {
         executor: ExecutorService,
     ): PostHogReplayIntegration {
         return PostHogReplayIntegration(context, config, MainHandler(), executor)
+    }
+
+    // Robolectric resets WindowManagerGlobal between tests, but Curtains caches its old
+    // root list. Supply the actual activity explicitly rather than relying on that cache.
+    private fun mockCurtainsRoot(view: View): MockedStatic<Curtains> {
+        val mocked = mockStatic(Curtains::class.java)
+        mocked.`when`<List<View>> { Curtains.rootViews }.thenReturn(listOf(view))
+        mocked.`when`<MutableList<OnRootViewsChangedListener>> { Curtains.onRootViewsChangedListeners }
+            .thenReturn(mutableListOf())
+        return mocked
+    }
+
+    private class QueuedReplayExecutor(delegate: ExecutorService) : ExecutorService by delegate {
+        val tasks = mutableListOf<FutureTask<*>>()
+        var reject = false
+
+        override fun submit(task: Runnable): Future<*> {
+            if (reject) throw RejectedExecutionException("Test rejection")
+            return FutureTask(task, null).also { tasks.add(it) }
+        }
+    }
+
+    @Test
+    fun `draw requests are coalesced per window while capture is queued`() {
+        val executor = QueuedReplayExecutor(createReplayExecutor())
+        val tasks = executor.tasks
+        val config = configWithSampling(flagActive = true, samplingPasses = true)
+        config.sessionReplayConfig.throttleDelayMs = 0
+        val sut = getSutWithExecutor(config, executor)
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val curtains = mockCurtainsRoot(controller.get().window.decorView)
+        sut.install(createPostHogFake())
+        try {
+            sut.start(resumeCurrent = true)
+            shadowOf(Looper.getMainLooper()).idle()
+            val status = assertNotNull(sut.decorViews[controller.get().window.decorView])
+            tasks.forEach { it.run() }
+            tasks.clear()
+
+            repeat(100) { status.listener.onDraw() }
+
+            assertEquals(1, tasks.size)
+            // Coalescing must not suppress the unthrottled draw/mask callback.
+            assertTrue(status.drawState.isOnDrawnCalled)
+
+            // An early bail (stopped before execution) must release the gate too.
+            sut.stop()
+            tasks.removeAt(0).run()
+            sut.start(resumeCurrent = true)
+            status.listener.onDraw()
+            assertEquals(1, tasks.size)
+        } finally {
+            sut.uninstall()
+            curtains.close()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test
+    fun `running capture blocks duplicates but not other windows`() {
+        val executor = createReplayExecutor()
+        val sut = getSutWithExecutor(PostHogAndroidConfig(API_KEY), executor)
+        val firstWindow = WindowDrawState()
+        val secondWindow = WindowDrawState()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            assertTrue(
+                sut.submitCapture(firstWindow) {
+                    entered.countDown()
+                    assertTrue(release.await(2, TimeUnit.SECONDS))
+                },
+            )
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            repeat(100) { assertFalse(sut.submitCapture(firstWindow) { error("Duplicate capture") }) }
+            assertTrue(sut.submitCapture(secondWindow) {})
+            assertFalse(sut.submitCapture(secondWindow) {})
+        } finally {
+            release.countDown()
+            awaitReplayExecutors()
+        }
+        assertTrue(sut.submitCapture(firstWindow) {})
+        assertTrue(sut.submitCapture(secondWindow) {})
+        awaitReplayExecutors()
+    }
+
+    @Test
+    fun `capture gate releases after rejection and task failure`() {
+        val executor = QueuedReplayExecutor(createReplayExecutor())
+        val sut = getSutWithExecutor(PostHogAndroidConfig(API_KEY), executor)
+        val drawState = WindowDrawState()
+        executor.reject = true
+        assertFalse(sut.submitCapture(drawState) {})
+        executor.reject = false
+        assertTrue(sut.submitCapture(drawState) { error("Capture failed") })
+        executor.tasks.removeAt(0).run()
+        assertTrue(sut.submitCapture(drawState) {})
+        executor.tasks.removeAt(0).run()
+    }
+
+    @Test
+    @OptIn(PostHogInternalReplayApi::class)
+    fun `bridge capture shares draw gate and reports once for accepted requests only`() {
+        val executor = QueuedReplayExecutor(createReplayExecutor())
+        val config = configWithSampling(flagActive = true, samplingPasses = true)
+        config.sessionReplayConfig.throttleDelayMs = 0
+        val sut = getSutWithExecutor(config, executor)
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val curtains = mockCurtainsRoot(controller.get().window.decorView)
+        sut.install(createPostHogFake())
+        try {
+            sut.start(resumeCurrent = true)
+            shadowOf(Looper.getMainLooper()).idle()
+            val status = assertNotNull(sut.decorViews[controller.get().window.decorView])
+            executor.tasks.forEach { it.run() }
+            executor.tasks.clear()
+            val results = mutableListOf<Boolean>()
+
+            assertTrue(sut.captureSessionReplaySnapshot(null, true, { false }) { results.add(it) })
+            assertFalse(sut.captureSessionReplaySnapshot(null, true, { true }) { error("Not scheduled") })
+            status.listener.onDraw()
+            assertEquals(1, executor.tasks.size)
+            assertTrue(results.isEmpty())
+            executor.tasks.removeAt(0).run()
+            assertEquals(listOf(false), results)
+
+            status.listener.onDraw()
+            assertFalse(sut.captureSessionReplaySnapshot(null, true, { true }) { error("Not scheduled") })
+            // Uninstalling with work queued must still let that work self-drop and release.
+            sut.uninstall()
+            executor.tasks.removeAt(0).run()
+            assertTrue(status.drawState.tryScheduleCapture())
+            status.drawState.finishScheduledCapture()
+        } finally {
+            sut.uninstall()
+            curtains.close()
+            controller.pause().stop().destroy()
+        }
     }
 
     // currentTimeMillis() on Android does a network-time lookup; count how often the touch path
@@ -296,6 +466,79 @@ internal class PostHogReplayIntegrationTest {
         }
     }
 
+    private fun dispatchTouch(
+        sut: PostHogReplayIntegration,
+        action: Int = MotionEvent.ACTION_DOWN,
+    ) {
+        val event = MotionEvent.obtain(0L, 0L, action, 42f, 73f, 0)
+        var dispatched = false
+        try {
+            val state =
+                sut.onTouchEventListener.intercept(event) {
+                    assertTrue(it === event)
+                    dispatched = true
+                    DispatchState.Consumed
+                }
+            assertTrue(dispatched, "Replay must dispatch the original touch to the app")
+            assertEquals(DispatchState.Consumed, state)
+        } finally {
+            event.recycle()
+        }
+    }
+
+    @Test
+    fun `captureTouches enabled by default records touch start and end coordinates`() {
+        val config = configWithSampling(flagActive = true, samplingPasses = true)
+        val executor = QueuedReplayExecutor(createReplayExecutor())
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val fake = createPostHogFake()
+        sut.install(fake)
+        try {
+            sut.start(resumeCurrent = true)
+            assertTrue(sut.isActive())
+            assertTrue(config.sessionReplayConfig.captureTouches)
+            listOf(
+                MotionEvent.ACTION_DOWN to RRMouseInteraction.TouchStart,
+                MotionEvent.ACTION_UP to RRMouseInteraction.TouchEnd,
+            ).forEach { (action, type) ->
+                dispatchTouch(sut, action)
+                executor.tasks.removeAt(0).run()
+                val events = fake.properties!!["\$snapshot_data"] as List<*>
+                val event = events.single() as RRIncrementalMouseInteractionEvent
+                val data = event.data as RRIncrementalMouseInteractionData
+                assertEquals(type, data.type)
+                assertEquals(42, data.x)
+                assertEquals(73, data.y)
+            }
+            assertEquals(2, fake.captures)
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `captureTouches initially false skips collection without stopping dispatch or replay`() {
+        val config = configWithSampling(flagActive = true, samplingPasses = true)
+        config.sessionReplayConfig.captureTouches = false
+        val executor = QueuedReplayExecutor(createReplayExecutor())
+        val dateCalls = AtomicInteger(0)
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val fake = createPostHogFake()
+        sut.install(fake)
+        try {
+            sut.start(resumeCurrent = true)
+            config.dateProvider = CountingDateProvider(dateCalls)
+            dispatchTouch(sut)
+            dispatchTouch(sut, MotionEvent.ACTION_UP)
+            assertTrue(sut.isActive())
+            assertEquals(0, executor.tasks.size, "Disabled touches must not queue coordinate capture")
+            assertEquals(0, dateCalls.get())
+            assertEquals(0, fake.captures)
+        } finally {
+            sut.uninstall()
+        }
+    }
+
     @Test
     fun `onSessionIdChanged starts replay when previously inactive and sampling passes`() {
         // The prior session may have been sampled out; rotation must re-evaluate sampling and
@@ -309,6 +552,34 @@ internal class PostHogReplayIntegrationTest {
             sut.onSessionIdChanged()
             shadowOf(Looper.getMainLooper()).idle()
 
+            assertTrue(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    @LooperMode(LooperMode.Mode.PAUSED)
+    fun `queued session rotation respects newly loaded event triggers`() {
+        val config = configWithSampling(flagActive = true, samplingPasses = true)
+        val sut = getSut(config)
+        val postHog = mock<PostHogInterface>()
+        whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+        sut.install(postHog)
+        try {
+            PostHogSessionManager.startSession()
+            sut.onSessionIdChanged()
+            assertFalse(sut.isActive())
+
+            // Config resolves after the restart is queued but before it runs on main.
+            whenever(config.remoteConfigHolder!!.getEventTriggers()).thenReturn(setOf("checkout_started"))
+            sut.onRemoteConfig()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(sut.isActive(), "Queued restart must wait for the newly configured trigger")
+
+            sut.onEvent("checkout_started", null)
+            shadowOf(Looper.getMainLooper()).idle()
             assertTrue(sut.isActive())
         } finally {
             sut.uninstall()
@@ -491,6 +762,301 @@ internal class PostHogReplayIntegrationTest {
 
             assertTrue(sut.isActive())
         } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `manually started replay resumes after the session is cleared and a new one starts`() {
+        val sut =
+            getSut(
+                configWithSampling(
+                    flagActive = true,
+                    samplingPasses = true,
+                    sessionReplay = false,
+                ),
+            )
+        val fake = createPostHogFake()
+        sut.install(fake)
+        try {
+            PostHogSessionManager.startSession()
+            sut.start(resumeCurrent = false)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(sut.isActive())
+
+            // Backgrounded past the inactivity window: the session is cleared and recording stops.
+            PostHogSessionManager.endSession()
+            sut.onSessionIdChanged()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(sut.isActive())
+
+            PostHogSessionManager.startSession()
+            sut.onSessionIdChanged()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `explicit stop of a manually started replay is not resumed by a rotation`() {
+        val sut =
+            getSut(
+                configWithSampling(
+                    flagActive = true,
+                    samplingPasses = true,
+                    sessionReplay = false,
+                ),
+            )
+        val fake = createPostHogFake()
+        sut.install(fake)
+        try {
+            PostHogSessionManager.startSession()
+            sut.start(resumeCurrent = false)
+            shadowOf(Looper.getMainLooper()).idle()
+            sut.stop()
+
+            PostHogSessionManager.endSession()
+            PostHogSessionManager.startSession()
+            sut.onSessionIdChanged()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `trigger started replay does not resume on a session the trigger has not activated`() {
+        val remoteConfig =
+            mock<PostHogRemoteConfig> {
+                on { isSessionReplayFlagActive() } doReturn true
+                on { makeSamplingDecision(any()) } doReturn true
+                on { getEventTriggers() } doReturn setOf("checkout_started")
+                on { hasRemoteConfigFetched() } doReturn true
+            }
+        val config =
+            PostHogAndroidConfig(API_KEY).apply {
+                remoteConfigHolder = remoteConfig
+                sessionReplay = true
+            }
+        val sut = getSut(config)
+        val postHog = mock<PostHogInterface>()
+        whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+        sut.install(postHog)
+        try {
+            PostHogSessionManager.startSession()
+            sut.onEvent("checkout_started", null)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertTrue(sut.isActive())
+
+            // Rotating into a session the trigger has not matched must stop recording, and remote
+            // config must not resume it behind the trigger gate.
+            PostHogSessionManager.endSession()
+            PostHogSessionManager.startSession()
+            sut.onSessionIdChanged()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(sut.isActive())
+
+            sut.onRemoteConfig()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `event trigger starts only when all replay gates pass`() {
+        data class GateCase(
+            val name: String,
+            val localEnabled: Boolean = true,
+            val flagActive: Boolean = true,
+            val samplingPasses: Boolean = true,
+            val triggerMatches: Boolean = true,
+            val expectedActive: Boolean = false,
+        )
+
+        val cases =
+            listOf(
+                GateCase("flag off, trigger not matched", flagActive = false, triggerMatches = false),
+                GateCase("flag off, trigger matched", flagActive = false),
+                GateCase("flag on, trigger not matched", triggerMatches = false),
+                GateCase("all gates pass", expectedActive = true),
+                GateCase("local switch off", localEnabled = false),
+                GateCase("sampled out", samplingPasses = false),
+            )
+
+        for (case in cases) {
+            val config =
+                configWithSampling(
+                    flagActive = case.flagActive,
+                    samplingPasses = case.samplingPasses,
+                    sessionReplay = case.localEnabled,
+                    triggers = setOf("checkout_started"),
+                )
+            val sut = getSut(config)
+            val postHog = mock<PostHogInterface>()
+            whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+            sut.install(postHog)
+            try {
+                PostHogSessionManager.startSession()
+                sut.onEvent(if (case.triggerMatches) "checkout_started" else "product_viewed", null)
+                shadowOf(Looper.getMainLooper()).idle()
+
+                assertEquals(case.expectedActive, sut.isActive(), case.name)
+            } finally {
+                sut.uninstall()
+                PostHogSessionManager.endSession()
+            }
+        }
+    }
+
+    @Test
+    fun `event trigger starts a manually requested recording while the master switch is off`() {
+        val config =
+            configWithSampling(
+                flagActive = true,
+                samplingPasses = true,
+                sessionReplay = false,
+                triggers = setOf("checkout_started"),
+            )
+        val sut = getSut(config)
+        val postHog = mock<PostHogInterface>()
+        whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+        sut.install(postHog)
+        try {
+            PostHogSessionManager.startSession()
+            // The trigger gate defers this start, but the intent must survive it.
+            sut.start(resumeCurrent = true)
+            shadowOf(Looper.getMainLooper()).idle()
+            assertFalse(sut.isActive())
+
+            sut.onEvent("checkout_started", null)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertTrue(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `event trigger activation is retained when another gate initially rejects recording`() {
+        val triggers = setOf("checkout_started")
+        val localConfig =
+            configWithSampling(
+                flagActive = true,
+                samplingPasses = true,
+                sessionReplay = false,
+                triggers = triggers,
+            )
+        val linkedFlag = AtomicBoolean(false)
+        val linkedFlagConfig = configWithSampling(flagActive = false, samplingPasses = true, triggers = triggers)
+        whenever(linkedFlagConfig.remoteConfigHolder!!.isSessionReplayFlagActive()).thenAnswer { linkedFlag.get() }
+        val sampling = AtomicBoolean(false)
+        val samplingConfig = configWithSampling(flagActive = true, samplingPasses = false, triggers = triggers)
+        whenever(samplingConfig.remoteConfigHolder!!.makeSamplingDecision(any())).thenAnswer { sampling.get() }
+        val cases =
+            listOf(
+                Triple("master switch", localConfig) { localConfig.sessionReplay = true },
+                Triple("linked flag", linkedFlagConfig) { linkedFlag.set(true) },
+                Triple("sampling", samplingConfig) { sampling.set(true) },
+            )
+
+        for ((name, config, openGate) in cases) {
+            val sut = getSut(config)
+            val postHog = mock<PostHogInterface>()
+            whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+            sut.install(postHog)
+            try {
+                PostHogSessionManager.startSession()
+                sut.onEvent("checkout_started", null)
+                assertFalse(sut.isActive(), "started before the $name gate opened")
+
+                openGate()
+                sut.onRemoteConfig()
+                shadowOf(Looper.getMainLooper()).idle()
+
+                assertTrue(sut.isActive(), "did not reuse trigger activation after the $name gate opened")
+            } finally {
+                sut.uninstall()
+                PostHogSessionManager.endSession()
+            }
+        }
+    }
+
+    @Test
+    fun `explicit stop cancels a manual start waiting for an event trigger`() {
+        val config =
+            configWithSampling(
+                flagActive = true,
+                samplingPasses = true,
+                sessionReplay = false,
+                triggers = setOf("checkout_started"),
+            )
+        val sut = getSut(config)
+        val postHog = mock<PostHogInterface>()
+        whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+        sut.install(postHog)
+        try {
+            PostHogSessionManager.startSession()
+            sut.start(resumeCurrent = true)
+            assertFalse(sut.isActive())
+
+            sut.stop()
+            sut.onEvent("checkout_started", null)
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(sut.isActive())
+        } finally {
+            sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `concurrent local disable does not give an event trigger manual start provenance`() {
+        val samplingStarted = CountDownLatch(1)
+        val continueSampling = CountDownLatch(1)
+        val config =
+            configWithSampling(
+                flagActive = true,
+                samplingPasses = true,
+                triggers = setOf("checkout_started"),
+            )
+        whenever(config.remoteConfigHolder!!.makeSamplingDecision(any())).thenAnswer {
+            samplingStarted.countDown()
+            assertTrue(continueSampling.await(2, TimeUnit.SECONDS))
+            true
+        }
+        val sut = getSut(config)
+        val postHog = mock<PostHogInterface>()
+        whenever(postHog.getSessionId()).thenAnswer { PostHogSessionManager.peekSessionId() }
+        sut.install(postHog)
+        val eventExecutor = Executors.newSingleThreadExecutor()
+        try {
+            PostHogSessionManager.startSession()
+            val event = eventExecutor.submit { sut.onEvent("checkout_started", null) }
+            assertTrue(samplingStarted.await(2, TimeUnit.SECONDS))
+
+            config.sessionReplay = false
+            continueSampling.countDown()
+            event.get(2, TimeUnit.SECONDS)
+            assertTrue(sut.isActive())
+
+            // The racing automatic start may win, but it must remain automatic so the next
+            // reevaluation can stop it instead of preserving it as a manual recording.
+            sut.onRemoteConfig()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertFalse(sut.isActive())
+        } finally {
+            continueSampling.countDown()
+            eventExecutor.shutdownNow()
             sut.uninstall()
         }
     }
@@ -1474,6 +2040,7 @@ internal class PostHogReplayIntegrationTest {
             awaitCondition { fx.replayQueue.bufferDepth == 0 && fx.replayQueue.depth == 2 }
             assertEquals(0, fx.replayQueue.bufferDepth)
             assertEquals(2, fx.replayQueue.depth)
+            shadowOf(Looper.getMainLooper()).idle()
             assertTrue(fx.sut.isActive())
         } finally {
             fx.sut.uninstall()
@@ -1534,19 +2101,181 @@ internal class PostHogReplayIntegrationTest {
             .setInt(attachInfo, View.VISIBLE)
     }
 
-    private fun screenshotFixture(enableMaskAlignmentVerification: Boolean = true): Pair<RealQueueFixture, PostHogFake> {
+    private fun screenshotFixture(
+        enableMaskAlignmentVerification: Boolean = true,
+        captureTouches: Boolean = true,
+    ): Pair<RealQueueFixture, PostHogFake> {
         val fx =
             createIntegrationWithRealQueue(
                 flagActive = true,
                 hasFetched = true,
                 integrationContext = ApplicationProvider.getApplicationContext(),
             )
+        fx.config.sessionReplayConfig.captureTouches = captureTouches
         fx.config.sessionReplayConfig.screenshot = true
         fx.config.sessionReplayConfig.verifyScreenshotMaskAlignment = enableMaskAlignmentVerification
         val fake = PostHogFake()
-        fx.sut.install(fake)
+        PostHogSessionManager.startSession()
+        fx.sut.install(
+            object : PostHogInterface by fake {
+                override fun getSessionId(): UUID? = PostHogSessionManager.getActiveSessionId()
+            },
+        )
         fx.sut.start(resumeCurrent = true)
         return fx to fake
+    }
+
+    @Implements(PixelCopy::class)
+    class SnapshotBoundaryShadowPixelCopy {
+        companion object {
+            var afterMasking: (() -> Unit)? = null
+
+            @JvmStatic
+            @Implementation
+            fun request(
+                window: Window,
+                bitmap: Bitmap,
+                listener: PixelCopy.OnPixelCopyFinishedListener,
+                handler: Handler,
+            ) {
+                listener.onPixelCopyFinished(PixelCopy.SUCCESS)
+                // Pause after privacy validation, while generateSnapshot still owns the frame.
+                afterMasking?.invoke()
+            }
+        }
+    }
+
+    private fun assertSnapshotBoundary(boundary: (PostHogReplayIntegration) -> Unit) {
+        val (fx, fake) = screenshotFixture()
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        try {
+            shadowOf(Looper.getMainLooper()).idle()
+            val window = controller.get().window
+            val view = window.decorView
+            makeWindowVisible(view)
+            val status = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+            fx.sut.decorViews[view] = status
+            val executor = createReplayExecutor()
+            var boundaryCompleted = false
+            SnapshotBoundaryShadowPixelCopy.afterMasking = {
+                // A separate thread also proves stop/reset do not wait for screenshot processing.
+                executor.submit { boundary(fx.sut) }.get(2, TimeUnit.SECONDS)
+                boundaryCompleted = true
+            }
+
+            val delivered = fx.sut.generateSnapshot(WeakReference(view), WeakReference(window))
+            assertTrue(boundaryCompleted, "Session controls must not wait for screenshot processing")
+            assertFalse(delivered)
+            assertEquals(0, fake.captures)
+            assertFalse(status.sentMetaEvent)
+            assertFalse(status.sentFullSnapshot)
+            assertEquals(null, status.lastSnapshot)
+
+            SnapshotBoundaryShadowPixelCopy.afterMasking = null
+            fx.sut.start(resumeCurrent = true)
+            assertTrue(fx.sut.generateSnapshot(WeakReference(view), WeakReference(window)))
+            val events = fake.properties!!["\$snapshot_data"] as List<*>
+            assertTrue(events[0] is RRMetaEvent)
+            assertTrue(events[1] is RRFullSnapshotEvent)
+            assertEquals(PostHogSessionManager.peekSessionId().toString(), fake.properties!!["\$session_id"])
+            assertEquals(fake.properties!!["\$session_id"], fake.properties!!["\$window_id"])
+        } finally {
+            SnapshotBoundaryShadowPixelCopy.afterMasking = null
+            fx.sut.uninstall()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [SnapshotBoundaryShadowPixelCopy::class])
+    fun `in flight snapshot is discarded on stop`() {
+        assertSnapshotBoundary { it.stop() }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [SnapshotBoundaryShadowPixelCopy::class])
+    fun `in flight snapshot is not revived by same session resume`() {
+        assertSnapshotBoundary {
+            it.stop()
+            it.start(resumeCurrent = true)
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [SnapshotBoundaryShadowPixelCopy::class])
+    fun `in flight snapshot cannot consume a rotated session keyframe`() {
+        assertSnapshotBoundary {
+            PostHogSessionManager.setSessionId(UUID.randomUUID())
+            it.onSessionIdChanged()
+            it.start(resumeCurrent = true)
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [SnapshotBoundaryShadowPixelCopy::class])
+    fun `in flight snapshot is discarded before session listener runs`() {
+        assertSnapshotBoundary {
+            PostHogSessionManager.setSessionId(UUID.randomUUID())
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [SnapshotBoundaryShadowPixelCopy::class])
+    fun `committed snapshot keeps its session when rotation precedes core enrichment`() {
+        val config = PostHogAndroidConfig(API_KEY)
+        @Suppress("DEPRECATION")
+        config.remoteConfig = false
+        config.preloadFeatureFlags = false
+        var captured: PostHogEvent? = null
+        config.addBeforeSend { event ->
+            captured = event
+            null // Inspect enrichment without queuing or sending anything.
+        }
+        val core = PostHog.with(config)
+        PostHogSessionManager.startSession()
+        val sessionId = PostHogSessionManager.peekSessionId().toString()
+        val fx = createIntegrationWithRealQueue(true, true, integrationContext = ApplicationProvider.getApplicationContext())
+        fx.config.sessionReplayConfig.screenshot = true
+        val client =
+            object : PostHogInterface by core {
+                override fun capture(
+                    event: String,
+                    distinctId: String?,
+                    properties: Map<String, Any>?,
+                    userProperties: Map<String, Any>?,
+                    userPropertiesSetOnce: Map<String, Any>?,
+                    groups: Map<String, String>?,
+                    timestamp: Date?,
+                ) {
+                    PostHogSessionManager.setSessionId(UUID.randomUUID())
+                    fx.sut.onSessionIdChanged()
+                    core.capture(event, distinctId, properties, userProperties, userPropertiesSetOnce, groups, timestamp)
+                }
+            }
+        fx.sut.install(client)
+        fx.sut.start(resumeCurrent = true)
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        try {
+            shadowOf(Looper.getMainLooper()).idle()
+            val window = controller.get().window
+            val view = window.decorView
+            makeWindowVisible(view)
+            val status = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+            fx.sut.decorViews[view] = status
+
+            assertTrue(fx.sut.generateSnapshot(WeakReference(view), WeakReference(window)))
+            val event = assertNotNull(captured)
+            assertEquals(sessionId, event.properties!!["\$session_id"])
+            assertEquals(sessionId, event.properties!!["\$window_id"])
+            assertNotEquals(sessionId, PostHogSessionManager.peekSessionId().toString())
+            assertFalse(status.sentMetaEvent)
+            assertFalse(status.sentFullSnapshot)
+            assertEquals(null, status.lastSnapshot)
+        } finally {
+            fx.sut.uninstall()
+            core.close()
+            controller.pause().stop().destroy()
+        }
     }
 
     @Test
@@ -1577,8 +2306,63 @@ internal class PostHogReplayIntegrationTest {
             fx.sut.generateSnapshot(WeakReference(decorView), WeakReference(mock<Window>()))
 
             assertEquals(0, fake.captures)
+            val drawState = fx.sut.decorViews[decorView]!!.drawState
+            assertTrue(drawState.tryScheduleCapture())
+            drawState.finishScheduledCapture()
         } finally {
             fx.sut.uninstall()
+        }
+    }
+
+    @Implements(PixelCopy::class)
+    class DelayedShadowPixelCopy {
+        companion object {
+            var callback: PixelCopy.OnPixelCopyFinishedListener? = null
+
+            @JvmStatic
+            @Implementation
+            fun request(
+                window: Window,
+                bitmap: Bitmap,
+                listener: PixelCopy.OnPixelCopyFinishedListener,
+                handler: Handler,
+            ) {
+                callback = listener
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [DelayedShadowPixelCopy::class])
+    fun `timed out PixelCopy keeps capture gate closed until callback completes`() {
+        val (fx, fake) = screenshotFixture()
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        try {
+            shadowOf(Looper.getMainLooper()).idle()
+            val window = controller.get().window
+            val decorView = window.decorView
+            makeWindowVisible(decorView)
+            val status = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+            fx.sut.decorViews[decorView] = status
+            assertTrue(status.drawState.tryScheduleCapture())
+
+            assertFalse(fx.sut.generateSnapshot(WeakReference(decorView), WeakReference(window)))
+            status.drawState.finishScheduledCapture()
+            assertNotNull(DelayedShadowPixelCopy.callback)
+            assertFalse(status.drawState.tryScheduleCapture())
+            assertEquals(0, fake.captures)
+
+            // Stop/reset cannot release the gate while Android still owns the bitmap.
+            fx.sut.stop()
+            assertFalse(status.drawState.tryScheduleCapture())
+            DelayedShadowPixelCopy.callback!!.onPixelCopyFinished(PixelCopy.SUCCESS)
+            assertTrue(status.drawState.tryScheduleCapture())
+            status.drawState.finishScheduledCapture()
+            assertEquals(0, fake.captures)
+        } finally {
+            DelayedShadowPixelCopy.callback = null
+            fx.sut.uninstall()
+            controller.pause().stop().destroy()
         }
     }
 
@@ -1602,6 +2386,524 @@ internal class PostHogReplayIntegrationTest {
             assertEquals("\$snapshot", fake.event)
         } finally {
             fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
+    fun `captureTouches disabled leaves screenshot capture active`() {
+        val (fx, fake) = screenshotFixture(captureTouches = false)
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        try {
+            shadowOf(Looper.getMainLooper()).idle()
+            val window = controller.get().window
+            val view = window.decorView
+            makeWindowVisible(view)
+            fx.sut.decorViews[view] = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+
+            assertTrue(fx.sut.isActive())
+            assertTrue(fx.sut.generateSnapshot(WeakReference(view), WeakReference(window)))
+            assertEquals(1, fake.captures)
+            val events = fake.properties!!["\$snapshot_data"] as List<*>
+            assertTrue(events[0] is RRMetaEvent)
+            assertTrue(events[1] is RRFullSnapshotEvent)
+        } finally {
+            fx.sut.uninstall()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `screenshot capture reuses a full resolution ARGB8888 destination by default`() {
+        val h = screenshotCaptureHarness()
+        RecordingShadowPixelCopy.reset()
+        try {
+            h.hookLayout.layout(0, 0, 101, 99)
+            h.child.layout(0, 0, 101, 20)
+
+            repeat(2) {
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            }
+
+            val (first, second) = RecordingShadowPixelCopy.requests
+            assertTrue(first.bitmap === second.bitmap)
+            for (request in RecordingShadowPixelCopy.requests) {
+                assertEquals(101, request.width)
+                assertEquals(99, request.height)
+                assertEquals(Bitmap.Config.ARGB_8888, request.config)
+                assertFalse(request.bitmap.isRecycled)
+            }
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `overlapping stop and start cannot leave active replay with a closed screenshot buffer`() {
+        val h = screenshotCaptureHarness()
+        val buffer = ReflectionHelpers.getField<PixelCopyBitmapBuffer>(h.fx.sut, "pixelCopyBitmapBuffer")
+        val stopper = Thread { h.fx.sut.stop() }
+        RecordingShadowPixelCopy.reset()
+        try {
+            synchronized(buffer) {
+                stopper.start()
+                awaitCondition { stopper.state == Thread.State.BLOCKED }
+                // Restart while the stopping thread is waiting for the buffer monitor.
+                h.fx.sut.start(resumeCurrent = true)
+            }
+            stopper.join(3000)
+            assertFalse(stopper.isAlive)
+
+            // The last transition may have stopped recording, but an active integration must
+            // already own an open buffer and must not need an extra restart to capture again.
+            if (!h.fx.sut.isActive()) {
+                h.fx.sut.start(resumeCurrent = true)
+            }
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(1, h.fake.captures)
+        } finally {
+            stopper.join(3000)
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `default screenshot capture continues after a timeout and recycles late bitmaps`() {
+        val h = screenshotCaptureHarness()
+        RecordingShadowPixelCopy.reset()
+        RecordingShadowPixelCopy.defer = true
+        try {
+            repeat(2) {
+                assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            }
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
+            val (first, second) = RecordingShadowPixelCopy.requests
+            assertFalse(first.bitmap === second.bitmap)
+            assertFalse(first.bitmap.isRecycled)
+            assertFalse(second.bitmap.isRecycled)
+            assertEquals(0, h.fake.captures)
+
+            RecordingShadowPixelCopy.complete(0)
+            assertFalse(first.bitmap.isRecycled)
+            assertFalse(second.bitmap.isRecycled)
+
+            RecordingShadowPixelCopy.defer = false
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            RecordingShadowPixelCopy.complete(1)
+            assertTrue(second.bitmap.isRecycled)
+            assertEquals(1, h.fake.captures)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @RunWith(ParameterizedRobolectricTestRunner::class)
+    class ScreenshotSettingsTest(
+        private val scale: Float,
+        private val colorMode: PostHogScreenshotColorMode,
+        private val verifyMaskAlignment: Boolean,
+    ) {
+        private val fixture = PostHogReplayIntegrationTest()
+
+        @get:Rule
+        val tmpDir = fixture.tmpDir
+
+        @BeforeTest
+        fun setUp() = fixture.`set up`()
+
+        @AfterTest
+        fun tearDown() = fixture.`tear down`()
+
+        companion object {
+            @JvmStatic
+            @Parameters(name = "scale={0}, colorMode={1}, verifyMasks={2}")
+            fun settings(): List<Array<Any>> =
+                listOf(1f, 0.5f, 0.333f, 0.1f).flatMap { scale ->
+                    PostHogScreenshotColorMode.values().flatMap { colorMode ->
+                        listOf(false, true).map { verify -> arrayOf(scale, colorMode, verify) }
+                    }
+                }
+        }
+
+        private fun captureHarness(): ScreenshotCaptureHarness =
+            fixture.screenshotCaptureHarness(enableMaskAlignmentVerification = verifyMaskAlignment).also {
+                it.fx.config.sessionReplayConfig.screenshotScale = scale
+                it.fx.config.sessionReplayConfig.screenshotColorMode = colorMode
+            }
+
+        private val otherColorMode: PostHogScreenshotColorMode
+            get() =
+                if (colorMode == PostHogScreenshotColorMode.ARGB_8888) {
+                    PostHogScreenshotColorMode.RGB_565
+                } else {
+                    PostHogScreenshotColorMode.ARGB_8888
+                }
+
+        @Test
+        @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+        fun `screenshot settings can change while a previous capture is pending`() {
+            val h = captureHarness()
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.defer = true
+            try {
+                assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val pendingBitmap = RecordingShadowPixelCopy.requests.single().bitmap
+
+                val nextScale = if (scale == 1f) 0.5f else 1f
+                h.fx.config.sessionReplayConfig.screenshotScale = nextScale
+                h.fx.config.sessionReplayConfig.screenshotColorMode = otherColorMode
+                RecordingShadowPixelCopy.defer = false
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val current = RecordingShadowPixelCopy.requests[1]
+                assertEquals(ceil(100 * nextScale).toInt(), current.width)
+                assertEquals(otherColorMode.name, assertNotNull(current.config).name)
+                assertFalse(pendingBitmap === current.bitmap)
+                assertFalse(pendingBitmap.isRecycled)
+                assertTrue(current.bitmap.isRecycled)
+
+                RecordingShadowPixelCopy.complete(0)
+                h.fx.config.sessionReplayConfig.screenshotScale = scale
+                h.fx.config.sessionReplayConfig.screenshotColorMode = colorMode
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                assertTrue(pendingBitmap === RecordingShadowPixelCopy.requests[2].bitmap)
+                assertEquals(2, h.fake.captures)
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+
+        @Test
+        @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+        fun `late screenshot callbacks release their bitmap after uninstall`() {
+            val h = captureHarness()
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.defer = true
+            try {
+                assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val bitmap = RecordingShadowPixelCopy.requests.single().bitmap
+                h.fx.sut.uninstall()
+                assertFalse(bitmap.isRecycled)
+
+                RecordingShadowPixelCopy.complete(0)
+                assertTrue(bitmap.isRecycled)
+                assertEquals(0, h.fake.captures)
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+
+        @Test
+        @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+        fun `small screenshot destinations retain at least one pixel`() {
+            val h = captureHarness()
+            h.hookLayout.layout(0, 0, 1, 1)
+            RecordingShadowPixelCopy.reset()
+            try {
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val request = RecordingShadowPixelCopy.requests.single()
+                assertEquals(1, request.width)
+                assertEquals(1, request.height)
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+
+        @Test
+        @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+        fun `source resize during PixelCopy discards the frame`() {
+            val h = captureHarness()
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.onRequest = { h.hookLayout.layout(0, 0, 101, 99) }
+            try {
+                assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                assertEquals(0, h.fake.captures)
+                RecordingShadowPixelCopy.onRequest = null
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+
+        private fun screenshotBitmap(fake: PostHogFake): Bitmap {
+            @Suppress("UNCHECKED_CAST")
+            val events = fake.properties?.get("\$snapshot_data") as List<RREvent>
+            val fullSnapshot = events.first { it.type == RREventType.FullSnapshot }
+            val wireframes = (fullSnapshot.data as Map<*, *>)["wireframes"] as List<*>
+            val wireframe = wireframes.single() as RRWireframe
+            val bytes = Base64.decode(assertNotNull(wireframe.base64).substringAfter(','), Base64.DEFAULT)
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        }
+
+        @Test
+        @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+        @GraphicsMode(GraphicsMode.Mode.NATIVE)
+        fun `encoded screenshot scale and alpha follow independent settings`() {
+            val h = captureHarness()
+            h.hookLayout.layout(0, 0, 101, 99)
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.onRequest = { it.eraseColor(Color.TRANSPARENT) }
+            try {
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val bitmap = screenshotBitmap(h.fake)
+                try {
+                    assertEquals(ceil(101 * scale).toInt(), bitmap.width)
+                    assertEquals(ceil(99 * scale).toInt(), bitmap.height)
+                    assertEquals(if (colorMode == PostHogScreenshotColorMode.RGB_565) 255 else 0, Color.alpha(bitmap.getPixel(0, 0)))
+                } finally {
+                    bitmap.recycle()
+                }
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+
+        @Test
+        @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+        @GraphicsMode(GraphicsMode.Mode.NATIVE)
+        fun `mask scaling uses captured settings even when they change during PixelCopy`() {
+            val h = captureHarness()
+            h.hookLayout.layout(0, 0, 300, 300)
+            h.child.layout(40, 40, 140, 140)
+            val mask = Rect()
+            assertTrue(h.child.getGlobalVisibleRect(mask))
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.onRequest = {
+                it.eraseColor(Color.RED)
+                h.fx.config.sessionReplayConfig.screenshotScale = if (scale == 1f) 0.5f else 1f
+                h.fx.config.sessionReplayConfig.screenshotColorMode = otherColorMode
+            }
+            try {
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                val bitmap = screenshotBitmap(h.fake)
+                try {
+                    assertEquals(ceil(300 * scale).toInt(), bitmap.width)
+                    val scaleX = bitmap.width / 300f
+                    val scaleY = bitmap.height / 300f
+                    val y = (mask.centerY() * scaleY).toInt()
+                    val maskedPixel = bitmap.getPixel((mask.centerX() * scaleX).toInt(), y)
+                    // Lossy WebP can slightly perturb a solid black mask.
+                    assertTrue(Color.red(maskedPixel) < 10 && Color.green(maskedPixel) < 10 && Color.blue(maskedPixel) < 10)
+                    assertTrue(Color.red(bitmap.getPixel(((mask.left - 20) * scaleX).toInt(), y)) > 200)
+                    assertTrue(Color.red(bitmap.getPixel(((mask.right + 20) * scaleX).toInt(), y)) > 200)
+                } finally {
+                    bitmap.recycle()
+                }
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+    }
+
+    @RunWith(ParameterizedRobolectricTestRunner::class)
+    class ScreenshotCompressionTest(private val quality: Int) {
+        private val fixture = PostHogReplayIntegrationTest()
+
+        @get:Rule
+        val tmpDir = fixture.tmpDir
+
+        @BeforeTest
+        fun setUp() = fixture.`set up`()
+
+        @AfterTest
+        fun tearDown() = fixture.`tear down`()
+
+        companion object {
+            @JvmStatic
+            @Parameters(name = "compressionQuality={0}")
+            fun qualities(): List<Array<Int>> = listOf(arrayOf(0), arrayOf(30), arrayOf(100))
+        }
+
+        @Test
+        @Config(sdk = [28, 29, 30], shadows = [RecordingShadowPixelCopy::class])
+        @GraphicsMode(GraphicsMode.Mode.NATIVE)
+        fun `WebP encoding uses compression quality sampled before PixelCopy`() {
+            val h = fixture.screenshotCaptureHarness()
+            h.fx.config.sessionReplayConfig.screenshotCompressionQuality = quality
+            RecordingShadowPixelCopy.reset()
+            RecordingShadowPixelCopy.onRequest = { bitmap ->
+                val pixels = IntArray(bitmap.width * bitmap.height) { i -> Color.rgb(i * 37 % 256, i * 71 % 256, i * 131 % 256) }
+                bitmap.setPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+                h.fx.config.sessionReplayConfig.screenshotCompressionQuality = if (quality == 0) 100 else 0
+            }
+            try {
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                @Suppress("UNCHECKED_CAST")
+                val events = h.fake.properties?.get("\$snapshot_data") as List<RREvent>
+                val full = events.first { it.type == RREventType.FullSnapshot }
+                val wireframe = ((full.data as Map<*, *>)["wireframes"] as List<*>).single() as RRWireframe
+                val capturedBitmap = RecordingShadowPixelCopy.requests.single().bitmap
+                assertEquals(assertNotNull(capturedBitmap.webpBase64(quality)), wireframe.base64)
+                assertNotEquals(capturedBitmap.webpBase64(if (quality == 0) 100 else 0), wireframe.base64)
+            } finally {
+                h.fx.sut.uninstall()
+                RecordingShadowPixelCopy.reset()
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `screenshot capture reuses a half resolution RGB565 destination`() {
+        val h = screenshotCaptureHarness()
+        h.fx.config.sessionReplayConfig.screenshotScale = 0.5f
+        h.fx.config.sessionReplayConfig.screenshotColorMode = PostHogScreenshotColorMode.RGB_565
+        RecordingShadowPixelCopy.reset()
+        try {
+            h.hookLayout.layout(0, 0, 101, 99)
+            h.child.layout(0, 0, 101, 20)
+
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
+            val first = RecordingShadowPixelCopy.requests[0].bitmap
+            val second = RecordingShadowPixelCopy.requests[1].bitmap
+            assertTrue(first === second)
+            assertEquals(51, first.width)
+            assertEquals(50, first.height)
+            assertEquals(Bitmap.Config.RGB_565, first.config)
+
+            @Suppress("UNCHECKED_CAST")
+            val events = h.fake.properties?.get("\$snapshot_data") as List<RREvent>
+            val fullSnapshot = events.first { it.type == RREventType.FullSnapshot }
+            val wireframes = (fullSnapshot.data as Map<*, *>)["wireframes"] as List<*>
+            val wireframe = wireframes.single() as RRWireframe
+            val density = h.hookLayout.resources.displayMetrics.density
+            assertEquals((h.hookLayout.width / density).toInt(), wireframe.width)
+            assertEquals((h.hookLayout.height / density).toInt(), wireframe.height)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    fun `screenshot masks round outward when scaled`() {
+        val scaled = RectF()
+
+        with(getSut()) {
+            scaled.setScaledScreenshotMask(
+                Rect(1, 3, 2, 4),
+                scaleX = 51f / 101f,
+                scaleY = 50f / 99f,
+            )
+        }
+
+        assertEquals(RectF(0f, 1f, 2f, 3f), scaled)
+    }
+
+    @RunWith(ParameterizedRobolectricTestRunner::class)
+    class ScreenshotDimensionsTest(private val scale: Float, private val width: Int, private val height: Int) {
+        private val fixture = PostHogReplayIntegrationTest()
+
+        @get:Rule
+        val tmpDir = fixture.tmpDir
+
+        @BeforeTest
+        fun setUp() = fixture.`set up`()
+
+        @AfterTest
+        fun tearDown() = fixture.`tear down`()
+
+        companion object {
+            @JvmStatic
+            @Parameters(name = "scale={0}, resizedSource={1}x{2}")
+            fun dimensions(): List<Array<Any>> =
+                listOf(1f, 0.5f, 0.1f).flatMap { scale ->
+                    listOf(0 to 100, 100 to 0, -1 to 100, 100 to -1, 101 to 100, 100 to 101).map { (width, height) ->
+                        arrayOf(scale, width, height)
+                    }
+                }
+        }
+
+        @Test
+        @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
+        fun `screenshot capture discards a source resized during PixelCopy`() {
+            val h = fixture.screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+            h.fx.config.sessionReplayConfig.screenshotScale = scale
+            try {
+                DrawSequenceShadowPixelCopy.onRequest = {
+                    h.hookLayout.layout(0, 0, width, height)
+                }
+
+                assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                assertEquals(0, h.fake.captures)
+
+                DrawSequenceShadowPixelCopy.onRequest = null
+                h.hookLayout.layout(0, 0, 100, 100)
+                assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+                assertEquals(1, h.fake.captures)
+            } finally {
+                DrawSequenceShadowPixelCopy.onRequest = null
+                h.fx.sut.uninstall()
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `timed out PixelCopy lease stays quarantined while later captures complete`() {
+        val h = screenshotCaptureHarness()
+        h.fx.config.sessionReplayConfig.screenshotScale = 0.5f
+        h.fx.config.sessionReplayConfig.screenshotColorMode = PostHogScreenshotColorMode.RGB_565
+        RecordingShadowPixelCopy.reset()
+        RecordingShadowPixelCopy.defer = true
+        try {
+            assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            val timedOutBitmap = RecordingShadowPixelCopy.requests.single().bitmap
+            assertFalse(timedOutBitmap.isRecycled)
+
+            RecordingShadowPixelCopy.defer = false
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
+            assertFalse(timedOutBitmap === RecordingShadowPixelCopy.requests[1].bitmap)
+            assertFalse(timedOutBitmap.isRecycled)
+
+            RecordingShadowPixelCopy.complete(0)
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+
+            assertEquals(3, RecordingShadowPixelCopy.requests.size)
+            assertTrue(timedOutBitmap === RecordingShadowPixelCopy.requests[2].bitmap)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [RecordingShadowPixelCopy::class])
+    fun `invalid RGB565 destination falls back once to ARGB8888`() {
+        val h = screenshotCaptureHarness()
+        h.fx.config.sessionReplayConfig.screenshotScale = 0.5f
+        h.fx.config.sessionReplayConfig.screenshotColorMode = PostHogScreenshotColorMode.RGB_565
+        RecordingShadowPixelCopy.reset()
+        try {
+            RecordingShadowPixelCopy.result = PixelCopy.ERROR_DESTINATION_INVALID
+            assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            val rejectedBitmap = RecordingShadowPixelCopy.requests.single().bitmap
+            assertEquals(Bitmap.Config.RGB_565, rejectedBitmap.config)
+            assertTrue(rejectedBitmap.isRecycled)
+
+            RecordingShadowPixelCopy.result = PixelCopy.SUCCESS
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
+            assertEquals(Bitmap.Config.ARGB_8888, RecordingShadowPixelCopy.requests[1].bitmap.config)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
         }
     }
 
@@ -1644,6 +2946,342 @@ internal class PostHogReplayIntegrationTest {
         }
     }
 
+    // A class name the production Compose-view heuristic accepts, so a window containing it is
+    // treated as Compose-rooted.
+    private class FakeAndroidComposeView(context: Context) : View(context)
+
+    private class ThrowingChildFrameLayout(context: Context) : FrameLayout(context) {
+        override fun getChildAt(index: Int): View? {
+            throw IllegalStateException("broken hierarchy")
+        }
+    }
+
+    @Test
+    fun `compose rooted window uses the verified path when verification is disabled`() {
+        // A Compose redraw can never be classified as animation-only, so on the legacy path
+        // every frame is discarded. Compose-rooted windows must use the verified path instead,
+        // so the legacy animation-redraw classifier never runs for them.
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root = FrameLayout(activity).apply { addView(FakeAndroidComposeView(activity)) }
+            root.setHasTransientState(true)
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertFalse(drawState.isOnlyAnimationRedraw)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `compose rooted cache invalidates when layout changes`() {
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root =
+                FrameLayout(activity).apply {
+                    addView(View(activity))
+                    setHasTransientState(true)
+                }
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+            fx.sut.onDrawCallback(root, drawState)
+            assertTrue(drawState.isOnlyAnimationRedraw)
+
+            root.addView(FakeAndroidComposeView(activity))
+            drawState.recordLayout()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertFalse(drawState.isOnlyAnimationRedraw)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `compose detection failures fall back to the legacy classifier`() {
+        val messages = Collections.synchronizedList(mutableListOf<String>())
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        fx.config.logger =
+            object : PostHogLogger {
+                override fun log(message: String) {
+                    messages.add(message)
+                }
+
+                override fun isEnabled(): Boolean = true
+            }
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root =
+                ThrowingChildFrameLayout(activity).apply {
+                    addView(View(activity))
+                    setHasTransientState(true)
+                }
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertTrue(drawState.isOnlyAnimationRedraw)
+            assertTrue(messages.any { it.contains("Compose view detection failed") })
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    private class OnceThrowingChildFrameLayout(context: Context) : FrameLayout(context) {
+        private var thrown = false
+
+        override fun getChildAt(index: Int): View? {
+            if (!thrown) {
+                thrown = true
+                throw IllegalStateException("broken hierarchy")
+            }
+            return super.getChildAt(index)
+        }
+    }
+
+    @Test
+    fun `compose detection failure is not cached and re-runs on the next draw`() {
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root =
+                OnceThrowingChildFrameLayout(activity).apply {
+                    addView(FakeAndroidComposeView(activity))
+                    setHasTransientState(true)
+                }
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+            assertTrue(drawState.isOnlyAnimationRedraw)
+
+            drawState.recordDraw()
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertFalse(drawState.isOnlyAnimationRedraw)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    private class CountingChildFrameLayout(context: Context) : FrameLayout(context) {
+        var childWalkCount = 0
+
+        override fun getChildAt(index: Int): View? {
+            childWalkCount++
+            return super.getChildAt(index)
+        }
+    }
+
+    @Test
+    fun `positive compose verdict survives a layout without re-walking the tree`() {
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root =
+                CountingChildFrameLayout(activity).apply {
+                    addView(FakeAndroidComposeView(activity))
+                    setHasTransientState(true)
+                }
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+            assertFalse(drawState.isOnlyAnimationRedraw)
+            val walkCountAfterFirstDraw = root.childWalkCount
+            assertTrue(walkCountAfterFirstDraw > 0)
+
+            drawState.recordLayout()
+            drawState.recordDraw()
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertEquals(walkCountAfterFirstDraw, root.childWalkCount)
+            assertFalse(drawState.isOnlyAnimationRedraw)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `negative compose verdict is not re-walked on the first draw after every layout`() {
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root =
+                CountingChildFrameLayout(activity).apply {
+                    addView(View(activity))
+                    setHasTransientState(true)
+                }
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+            val walkCountAfterFirstDraw = root.childWalkCount
+            assertTrue(walkCountAfterFirstDraw > 0)
+
+            // A layout clears the "not Compose" verdict so lazily mounted Compose is still picked
+            // up, but the re-check is rate-limited, so the next draw must not re-walk the tree.
+            drawState.recordLayout()
+            drawState.recordDraw()
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertEquals(walkCountAfterFirstDraw, root.childWalkCount)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `non compose window keeps the legacy classifier when verification is disabled`() {
+        // Control for the Compose routing test: a plain View window still runs the legacy
+        // animation-redraw classifier.
+        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val root = FrameLayout(activity).apply { addView(View(activity)) }
+            root.setHasTransientState(true)
+            val drawState = WindowDrawState()
+            drawState.recordDraw()
+
+            fx.sut.onDrawCallback(root, drawState)
+
+            assertTrue(drawState.isOnlyAnimationRedraw)
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `warns after consecutive screenshot discards`() {
+        // A blank recording is silent: each discard logs a debug line, but nothing tells the
+        // customer the recording is empty. A run of discards must raise one warning.
+        val messages = Collections.synchronizedList(mutableListOf<String>())
+        val (fx, _) = screenshotFixture()
+        fx.config.logger =
+            object : PostHogLogger {
+                override fun log(message: String) {
+                    messages.add(message)
+                }
+
+                override fun isEnabled(): Boolean = true
+            }
+        try {
+            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+            shadowOf(Looper.getMainLooper()).idle()
+            val decorView = activity.window.decorView
+            makeWindowVisible(decorView)
+            val status = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+            fx.sut.decorViews[decorView] = status
+
+            // A mock window has no decor, so PixelCopy throws and every capture is discarded.
+            repeat(2) {
+                fx.sut.generateSnapshot(WeakReference(decorView), WeakReference(mock<Window>()))
+            }
+            assertFalse(messages.any { it.contains("screenshots in a row") })
+
+            status.drawState.resetSnapshotState()
+            repeat(3) {
+                fx.sut.generateSnapshot(WeakReference(decorView), WeakReference(mock<Window>()))
+            }
+
+            assertEquals(1, messages.count { it.contains("screenshots in a row") })
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
+    // Bitmap.createBitmap only throws for a degenerate size, but a zero/negative-size view is
+    // already filtered out earlier by isVisible(), before this code is reached (getWidth/
+    // getHeight are final so a call-counting View can't fake that out either). Shadowing
+    // Bitmap.createBitmap directly, gated on a sentinel width so unrelated bitmap allocation
+    // (e.g. theme inflation) still goes through the real implementation, is the actual lever
+    // for exercising this catch block.
+    @Implements(Bitmap::class)
+    class ThrowingShadowBitmap {
+        companion object {
+            const val SOURCE_ALLOCATION_FAILURE_WIDTH = 823476
+            const val ALLOCATION_FAILURE_WIDTH = SOURCE_ALLOCATION_FAILURE_WIDTH / 2
+
+            @JvmStatic
+            @Implementation
+            fun createBitmap(
+                width: Int,
+                height: Int,
+                config: Bitmap.Config,
+            ): Bitmap {
+                if (width == ALLOCATION_FAILURE_WIDTH) {
+                    throw IllegalArgumentException("width and height must be > 0")
+                }
+                return ReflectionHelpers.callStaticMethod(
+                    ShadowLegacyBitmap::class.java,
+                    "createBitmap",
+                    ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, width),
+                    ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, height),
+                    ReflectionHelpers.ClassParameter.from(Bitmap.Config::class.java, config),
+                )
+            }
+        }
+    }
+
+    @Test
+    @Config(sdk = [26], shadows = [ThrowingShadowBitmap::class])
+    fun `bitmap allocation failure feeds the discard counter`() {
+        val messages = Collections.synchronizedList(mutableListOf<String>())
+        val (fx, _) = screenshotFixture()
+        fx.config.logger =
+            object : PostHogLogger {
+                override fun log(message: String) {
+                    messages.add(message)
+                }
+
+                override fun isEnabled(): Boolean = true
+            }
+        try {
+            // Attach via WindowManager (not an Activity's themed decor) so isVisible() sees a
+            // real attached, visible view without going through theme drawable inflation, which
+            // would otherwise route unrelated Bitmap allocations through the sentinel-gated
+            // shadow below.
+            val context = ApplicationProvider.getApplicationContext<Context>()
+            val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val decorView =
+                View(context).apply {
+                    layout(0, 0, ThrowingShadowBitmap.SOURCE_ALLOCATION_FAILURE_WIDTH, 10)
+                }
+            windowManager.addView(
+                decorView,
+                WindowManager.LayoutParams(WindowManager.LayoutParams.TYPE_APPLICATION),
+            )
+            shadowOf(Looper.getMainLooper()).idle()
+            decorView.layout(0, 0, ThrowingShadowBitmap.SOURCE_ALLOCATION_FAILURE_WIDTH, 10)
+            makeWindowVisible(decorView)
+            fx.sut.decorViews[decorView] = ViewTreeSnapshotStatus(mock<NextDrawListener>())
+
+            repeat(3) {
+                fx.sut.generateSnapshot(WeakReference(decorView), WeakReference(mock<Window>()))
+            }
+
+            assertTrue(messages.any { it.contains("screenshot setup failed") })
+            assertEquals(1, messages.count { it.contains("screenshots in a row") })
+        } finally {
+            fx.sut.uninstall()
+        }
+    }
+
     @Test
     @Config(sdk = [26], shadows = [ShadowPixelCopy::class])
     fun `wireframe visibility does not race a delayed screenshot mask walk's shared scratch objects`() {
@@ -1656,7 +3294,12 @@ internal class PostHogReplayIntegrationTest {
             )
         fx.config.sessionReplayConfig.verifyScreenshotMaskAlignment = true
         val fake = PostHogFake()
-        fx.sut.install(fake)
+        PostHogSessionManager.startSession()
+        fx.sut.install(
+            object : PostHogInterface by fake {
+                override fun getSessionId(): UUID? = PostHogSessionManager.getActiveSessionId()
+            },
+        )
         fx.sut.start(resumeCurrent = true)
         val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         shadowOf(Looper.getMainLooper()).idle()
@@ -1726,7 +3369,7 @@ internal class PostHogReplayIntegrationTest {
                     )
                 }
             assertTrue(
-                guardedEntered.await(2, TimeUnit.SECONDS),
+                awaitDraining(guardedEntered, 3000),
                 "The delayed screenshot callback did not reach its guarded post-copy mask walk",
             )
 
@@ -1737,10 +3380,10 @@ internal class PostHogReplayIntegrationTest {
                         WeakReference(activity.window),
                     )
                 }
-            val callsOverlapped = wireframeEntered.await(1, TimeUnit.SECONDS)
+            val callsOverlapped = awaitDraining(wireframeEntered, 1500)
             releaseGuardedCall.countDown()
-            screenshotFuture.get(2, TimeUnit.SECONDS)
-            wireframeFuture.get(2, TimeUnit.SECONDS)
+            awaitDraining(screenshotFuture, 3000)
+            awaitDraining(wireframeFuture, 3000)
 
             assertFalse(guardedTimedOut.get(), "The guarded visibility hook timed out")
             val overlappingCallsWereSafe =
@@ -1760,6 +3403,38 @@ internal class PostHogReplayIntegrationTest {
             executor.shutdownNow()
             fx.sut.uninstall()
         }
+    }
+
+    // Robolectric's main looper only advances via idle() on the test thread. A bare
+    // latch/future wait would deadlock work that hops onto main (runOnMainThreadBlocking),
+    // so these alternate idle() with a short wait -- call only from the test thread.
+    private fun awaitDraining(
+        latch: CountDownLatch,
+        timeoutMs: Long,
+    ): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (latch.await(20, TimeUnit.MILLISECONDS)) return true
+        }
+        return latch.await(0, TimeUnit.MILLISECONDS)
+    }
+
+    private fun <T> awaitDraining(
+        future: Future<T>,
+        timeoutMs: Long,
+    ): T {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            try {
+                return future.get(20, TimeUnit.MILLISECONDS)
+            } catch (e: TimeoutException) {
+                // keep draining
+            }
+        }
+        // Loop already drained past the deadline, so this is a last-chance grab, not another wait.
+        return future.get(0, TimeUnit.MILLISECONDS)
     }
 
     private fun maskWalk(vararg rects: Rect): PostHogReplayIntegration.MaskWalk {
@@ -1897,6 +3572,51 @@ internal class PostHogReplayIntegrationTest {
             ) {
                 requestCount++
                 listener.onPixelCopyFinished(PixelCopy.SUCCESS)
+            }
+        }
+    }
+
+    @Implements(PixelCopy::class)
+    class RecordingShadowPixelCopy {
+        data class Request(
+            val bitmap: Bitmap,
+            val listener: PixelCopy.OnPixelCopyFinishedListener,
+        ) {
+            val width = bitmap.width
+            val height = bitmap.height
+            val config = bitmap.config
+        }
+
+        companion object {
+            val requests = mutableListOf<Request>()
+            var defer = false
+            var result = PixelCopy.SUCCESS
+            var onRequest: ((Bitmap) -> Unit)? = null
+
+            @JvmStatic
+            @Implementation
+            fun request(
+                window: Window,
+                bitmap: Bitmap,
+                listener: PixelCopy.OnPixelCopyFinishedListener,
+                handler: Handler,
+            ) {
+                requests.add(Request(bitmap, listener))
+                onRequest?.invoke(bitmap)
+                if (!defer) {
+                    listener.onPixelCopyFinished(result)
+                }
+            }
+
+            fun complete(index: Int) {
+                requests[index].listener.onPixelCopyFinished(result)
+            }
+
+            fun reset() {
+                requests.clear()
+                defer = false
+                result = PixelCopy.SUCCESS
+                onRequest = null
             }
         }
     }
@@ -2388,5 +4108,174 @@ internal class PostHogReplayIntegrationTest {
         } finally {
             h.fx.sut.uninstall()
         }
+    }
+
+    @Test
+    fun `a block that throws on the posted main-thread path does not crash and returns null`() {
+        // Production hops onto main from the capture executor thread, not from main itself, so
+        // this exercises the post-and-wait branch of runOnMainThreadBlocking, not the inline one.
+        val sut = getSut()
+        val throwingBlock: () -> String = { throw IllegalStateException("boom") }
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val future =
+                executor.submit(
+                    Callable {
+                        ReflectionHelpers.callInstanceMethod<String?>(
+                            sut,
+                            "runOnMainThreadBlocking",
+                            ReflectionHelpers.ClassParameter.from(Function0::class.java, throwingBlock),
+                        )
+                    },
+                )
+            // Pump the shadow main looper until the posted block (and its throw) has run.
+            var idled = 0
+            while (!future.isDone && idled < 50) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(20)
+                idled++
+            }
+            assertEquals(
+                null,
+                future.get(3000, TimeUnit.MILLISECONDS),
+                "A throwing block must degrade to null, not propagate onto the main Looper",
+            )
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `a timed-out arming does not leave an orphaned active capture`() {
+        // On timeout the posted arming Runnable still finishes later; it must cancel its own
+        // token rather than leave WindowDrawState reporting an active capture nobody will read.
+        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
+        shadowOf(Looper.getMainLooper()).idle()
+        val view = View(activity)
+        val drawState = WindowDrawState()
+        val sut = getSut()
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val future =
+                executor.submit(
+                    Callable {
+                        ReflectionHelpers.callInstanceMethod<Any?>(
+                            sut,
+                            "armMaskCapture",
+                            ReflectionHelpers.ClassParameter.from(View::class.java, view),
+                            ReflectionHelpers.ClassParameter.from(WindowDrawState::class.java, drawState),
+                        )
+                    },
+                )
+
+            // Do not idle() the main looper for over the 1000ms wait, so the waiter times out
+            // with the posted arming Runnable still sitting unexecuted in the shadow looper queue.
+            assertTrue(future.get(2000, TimeUnit.MILLISECONDS) == null, "Timed-out arming must return null")
+
+            // Now let the late Runnable finish arming and self-cancel.
+            shadowOf(Looper.getMainLooper()).idle()
+
+            assertEquals(
+                null,
+                drawState.beginDrawSample(),
+                "A timed-out arm must not leave an orphaned active capture behind",
+            )
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `discard warning fires exactly once per run of discards, even racing across threads`() {
+        // consecutiveScreenshotDiscards is incremented from the capture executor thread and the
+        // PixelCopy handler thread; the warning must still fire exactly once per run.
+        val drawState = WindowDrawState()
+        val threads = 4
+        val incrementsPerThread = 50
+        val warnings = AtomicInteger(0)
+        val ready = CountDownLatch(threads)
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(threads)
+
+        repeat(threads) {
+            Thread {
+                ready.countDown()
+                start.await()
+                repeat(incrementsPerThread) {
+                    if (drawState.recordScreenshotDiscard()) {
+                        warnings.incrementAndGet()
+                    }
+                }
+                done.countDown()
+            }.start()
+        }
+
+        assertTrue(ready.await(2000, TimeUnit.MILLISECONDS))
+        start.countDown()
+        assertTrue(done.await(5000, TimeUnit.MILLISECONDS))
+
+        assertEquals(1, warnings.get(), "The warning must fire exactly once for this run of discards")
+
+        drawState.resetScreenshotDiscards()
+        assertFalse(drawState.recordScreenshotDiscard()) // 1
+        assertFalse(drawState.recordScreenshotDiscard()) // 2
+        assertTrue(drawState.recordScreenshotDiscard()) // 3 - threshold reached, warns once
+        assertFalse(drawState.recordScreenshotDiscard(), "Past the threshold, further discards must not re-warn")
+    }
+
+    // ---- GAME-1277: keep an <img> out of the player's sniff window -----------
+    //
+    // process-all-snapshots.ts peeks at the first THREE adds; an <img> there makes
+    // the player synthesize a full snapshot holding only that image, wiping the
+    // document. Our images are 16-32px icons, so this fires constantly.
+    // Fail-on-purpose: delete the avoidScreenshotMisdetection call and the first
+    // test goes red.
+
+    private fun wfn(
+        id: Int,
+        parentId: Int?,
+        type: String? = null,
+        children: List<RRWireframe>? = null,
+    ) = RRWireframe(
+        id = id, x = 0, y = 0, width = 32, height = 32,
+        parentId = parentId, type = type, childWireframes = children,
+    )
+
+    @Test
+    fun `an image add is padded out of the player's sniff window`() {
+        val sut = getSut()
+        // A sticker graphic: root -> border -> blend -> the image itself.
+        val image = wfn(104, parentId = 103, type = "image")
+        val blend = wfn(103, parentId = 102, children = listOf(image))
+        val border = wfn(102, parentId = 101, children = listOf(blend))
+        val root = wfn(101, parentId = 1, children = listOf(border))
+        val oldItems = listOf(wfn(1, null), wfn(101, 1), wfn(102, 101), wfn(103, 102))
+        val newItems = listOf(wfn(1, null, children = listOf(root)), root, border, blend, image)
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        val flat = mutableListOf<RRWireframe>()
+        fun walk(w: RRWireframe) { flat.add(w); w.childWireframes?.forEach(::walk) }
+        added.forEach(::walk)
+        assertTrue(
+            flat.take(3).none { it.type == "image" },
+            "an <img> in the first 3 adds costs the whole document: ${flat.map { it.id to it.type }}",
+        )
+        assertTrue(flat.any { it.id == 104 }, "the image must still arrive")
+        assertTrue(removed.any { it.id == 101 || it.id == 102 }, "padding re-adds an ancestor subtree")
+    }
+
+    @Test
+    fun `a mutation with no image adds is left alone`() {
+        val sut = getSut()
+        val oldItems = listOf(wfn(1, null))
+        val newItems = listOf(wfn(1, null), wfn(200, 1))
+
+        val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
+
+        assertEquals(listOf(200), added.map { it.id }, "no image, so nothing to pad")
+        assertTrue(removed.isEmpty(), "padding must not invent removes")
     }
 }

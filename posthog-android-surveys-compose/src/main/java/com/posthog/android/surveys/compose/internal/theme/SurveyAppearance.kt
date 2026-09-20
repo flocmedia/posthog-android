@@ -33,6 +33,11 @@ internal data class ResolvedSurveyAppearance(
     val thankYouMessageDescription: String?,
     val thankYouMessageDescriptionContentType: PostHogDisplaySurveyTextContentType,
     val thankYouMessageCloseButtonText: String,
+    val displayIntroScreen: Boolean,
+    val introScreenHeader: String?,
+    val introScreenDescription: String?,
+    val introScreenDescriptionContentType: PostHogDisplaySurveyTextContentType,
+    val introScreenButtonText: String,
 )
 
 internal val LocalSurveyAppearance =
@@ -62,9 +67,9 @@ private val DefaultDescriptionTextColor = Color(0xFF8E8E93)
 // white) so it stays visible against the survey background; see resolve().
 private val DefaultInputBackgroundOnLight = Color(0xFFF8F8F8)
 
-private const val DEFAULT_PLACEHOLDER = "Start typing..."
 private const val DEFAULT_THANK_YOU_HEADER = "Thank you for your feedback!"
 private const val DEFAULT_THANK_YOU_CLOSE = "Close"
+private const val DEFAULT_INTRO_BUTTON = "Get started"
 
 internal fun PostHogDisplaySurveyAppearance?.resolve(): ResolvedSurveyAppearance {
     val backgroundColor =
@@ -99,7 +104,7 @@ internal fun PostHogDisplaySurveyAppearance?.resolve(): ResolvedSurveyAppearance
     val inputTextColor =
         parseSurveyColorOrDefault(this?.inputTextColor, inputBackgroundColor.contrastingTextColor())
     val placeholderTextColor = inputTextColor.copy(alpha = 0.5f)
-    val placeholder = this?.placeholder?.takeIf { it.isNotBlank() } ?: DEFAULT_PLACEHOLDER
+    val placeholder = this?.placeholder?.takeIf { it.isNotBlank() }.orEmpty()
 
     val displayThankYouMessage = this?.displayThankYouMessage ?: false
     val thankYouMessageHeader =
@@ -109,6 +114,16 @@ internal fun PostHogDisplaySurveyAppearance?.resolve(): ResolvedSurveyAppearance
         this?.thankYouMessageDescriptionContentType ?: PostHogDisplaySurveyTextContentType.TEXT
     val thankYouMessageCloseButtonText =
         this?.thankYouMessageCloseButtonText?.takeIf { it.isNotBlank() } ?: DEFAULT_THANK_YOU_CLOSE
+
+    val displayIntroScreen = this?.displayIntroScreen ?: false
+    // Unlike the thank-you header there is no default intro header text: a blank header is
+    // simply not rendered, matching the web SDK.
+    val introScreenHeader = this?.introScreenHeader?.takeIf { it.isNotBlank() }
+    val introScreenDescription = this?.introScreenDescription?.takeIf { it.isNotBlank() }
+    val introScreenDescriptionContentType =
+        this?.introScreenDescriptionContentType ?: PostHogDisplaySurveyTextContentType.TEXT
+    val introScreenButtonText =
+        this?.introScreenButtonText?.takeIf { it.isNotBlank() } ?: DEFAULT_INTRO_BUTTON
 
     return ResolvedSurveyAppearance(
         backgroundColor = backgroundColor,
@@ -130,6 +145,11 @@ internal fun PostHogDisplaySurveyAppearance?.resolve(): ResolvedSurveyAppearance
         thankYouMessageDescription = thankYouMessageDescription,
         thankYouMessageDescriptionContentType = thankYouMessageDescriptionContentType,
         thankYouMessageCloseButtonText = thankYouMessageCloseButtonText,
+        displayIntroScreen = displayIntroScreen,
+        introScreenHeader = introScreenHeader,
+        introScreenDescription = introScreenDescription,
+        introScreenDescriptionContentType = introScreenDescriptionContentType,
+        introScreenButtonText = introScreenButtonText,
     )
 }
 
