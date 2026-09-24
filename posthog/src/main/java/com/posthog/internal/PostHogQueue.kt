@@ -178,7 +178,52 @@ public class PostHogQueue<Record>(
         synchronized(dequeLock) {
             events = deque.take(batchLimits.cap)
         }
-        return events
+        return capBatchByBytes(events)
+    }
+
+    /**
+     * GAME-1315 — cap a batch by BYTES as well as by event count.
+     *
+     * [BatchLimits.cap] counts events, not size, so a batch of otherwise-ordinary events can
+     * still be arbitrarily large: 20 session-replay snapshots of a screen full of images
+     * measured over 1 MiB. Such a batch is accepted with `{"status":"Ok"}` and then dropped
+     * during ingest — the SDK's own 413 workaround below names the underlying limit ("png
+     * images exceed our max. limit in kafka"). Nothing client-side ever learns, and if the
+     * dropped batch carried a replay's establishing full snapshot the rest of that session is
+     * unplayable.
+     *
+     * [BatchLimits.halve] exists for this, but it only fires on a 413 that never arrives, so
+     * the count cap never adapts. Capping here makes the batch self-limiting up front.
+     *
+     * File length is the event as it was cached, which is what goes into the request body, so
+     * it needs no serialization to measure. At least one event is always taken: a single event
+     * larger than the cap must still be given its chance rather than wedging the queue forever.
+     */
+    private fun capBatchByBytes(files: List<File>): List<File> {
+        if (files.size < 2) return files
+
+        var total = 0L
+        val capped = ArrayList<File>(files.size)
+        for (file in files) {
+            val length =
+                try {
+                    file.length()
+                } catch (_: Throwable) {
+                    0L
+                }
+            if (capped.isNotEmpty() && total + length > MAX_BATCH_BYTES) {
+                break
+            }
+            capped.add(file)
+            total += length
+        }
+
+        if (capped.size < files.size) {
+            config.logger.log(
+                "Batch capped at ${capped.size} of ${files.size} events (${total} bytes) to stay under the ingest size limit.",
+            )
+        }
+        return capped
     }
 
     private fun flushBatch(isFatal: Boolean) {
@@ -490,6 +535,21 @@ public class PostHogQueue<Record>(
     internal val currentRetryCountForTesting: Int
         @PostHogVisibleForTesting
         get() = retryCount
+
+    @PostHogVisibleForTesting
+    internal fun capBatchByBytesForTesting(files: List<File>): List<File> = capBatchByBytes(files)
+
+    internal companion object {
+        /**
+         * GAME-1315 — maximum total cached-event bytes in one request body.
+         *
+         * Calibrated on measured outcomes, not a documented figure: a 2,800 KiB batch was
+         * dropped during ingest while a 572 KiB one went through. 512 KiB sits below the
+         * largest size known to survive, and the cliff between the two has not been located.
+         * Raise it only with evidence about where that cliff actually is.
+         */
+        internal const val MAX_BATCH_BYTES: Long = 512L * 1024L
+    }
 }
 
 internal class BatchLimits(
