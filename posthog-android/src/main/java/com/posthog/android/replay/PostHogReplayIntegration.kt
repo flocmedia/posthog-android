@@ -136,6 +136,14 @@ public class PostHogReplayIntegration(
     // the size at which ingest drops it. Touched only on the single-threaded snapshot executor.
     private val imageBudget = ReplayImageBudget()
 
+    // GAME-1236 — which decor view's full snapshot is the live document for the shared
+    // $window_id. When another content window takes over (editor -> share -> back to editor),
+    // its per-view sentFullSnapshot is still true, so it would emit INCREMENTAL mutations
+    // against a document that is no longer its own and orphan every node. Tracking ownership
+    // lets us re-emit a full instead. WeakReference so a destroyed decor view is never pinned.
+    @Volatile
+    private var currentDocumentOwner: WeakReference<View>? = null
+
     private val passwordInputTypes =
         setOf(
             InputType.TYPE_TEXT_VARIATION_PASSWORD,
@@ -767,6 +775,14 @@ public class PostHogReplayIntegration(
     // internal (not private) so tests can drive a snapshot pass directly.
     // Returns whether a frame was actually produced (false on every early bail),
     // so the bridge caller can tell "captured" from "silently skipped".
+    // Total wireframe nodes in a subtree (root plus all descendants). Tells a real content
+    // window from a lone-image overlay (GAME-1236 / posthog-android#752).
+    private fun subtreeNodeCount(wireframe: RRWireframe): Int {
+        var count = 1
+        wireframe.childWireframes?.forEach { count += subtreeNodeCount(it) }
+        return count
+    }
+
     internal fun generateSnapshot(
         viewRef: WeakReference<View>,
         windowRef: WeakReference<Window>,
@@ -803,6 +819,22 @@ public class PostHogReplayIntegration(
             } else {
                 view.toWireframe() ?: return false
             }
+
+        // GAME-1236 (regressed by the 1277 re-cut, restored here) — in wireframe mode capture
+        // ONLY full-screen, content-rich windows. Every Android decor view is snapshotted under
+        // the SAME $window_id, and the web player keeps one rrweb document per id, so any
+        // secondary window's FULL snapshot replaces the document the editor is drawing into and
+        // every later editor mutation is orphaned -- the replay freezes on the last good frame.
+        // Height separates a full-screen Activity from a floating dialog; node count separates it
+        // from the editor library's lone-image selection/drag overlays. Real dialogs here render
+        // in-layout, so dropping the separate ones loses no content. Screenshot mode is exempt:
+        // there each snapshot is a whole-screen bitmap with no shared document to stomp.
+        if (!useScreenshot) {
+            val nodeCount = subtreeNodeCount(wireframe)
+            if (wireframe.height < MIN_FULLSCREEN_HEIGHT_DP || nodeCount < MIN_CONTENT_WINDOW_NODES) {
+                return false
+            }
+        }
 
         // if the decorView has no backgroundColor, we use the theme color
         // no need to do this if we are capturing a screenshot
@@ -865,7 +897,10 @@ public class PostHogReplayIntegration(
             status.sentMetaEvent = true
         }
 
-        if (!status.sentFullSnapshot) {
+        // GAME-1236 — re-anchor when a DIFFERENT content window now owns the shared document.
+        // Emitting an incremental here would diff against another window's document.
+        val ownsDocument = currentDocumentOwner?.get() === view
+        if (!status.sentFullSnapshot || !ownsDocument) {
             val event =
                 RRFullSnapshotEvent(
                     listOf(wireframe),
@@ -875,6 +910,7 @@ public class PostHogReplayIntegration(
                 )
             events.add(event)
             status.sentFullSnapshot = true
+            currentDocumentOwner = WeakReference(view)
         } else {
             val lastSnapshot = status.lastSnapshot
             val lastSnapshots = if (lastSnapshot != null) listOf(lastSnapshot) else emptyList()
@@ -2657,6 +2693,10 @@ public class PostHogReplayIntegration(
                 resetViewSnapshotStates(it.value)
             }
         }
+        // GAME-1236 — drop document ownership too, so the next capture re-anchors with a fresh
+        // full. Leaving a stale owner here would let the next draw emit an incremental against a
+        // document that was just discarded.
+        currentDocumentOwner = null
     }
 
     override fun stop() {
@@ -3117,6 +3157,16 @@ public class PostHogReplayIntegration(
         // Pre-walk re-arm attempts per capture: a screen that redraws during every attempt
         // discards this tick and retries at the next scheduled snapshot.
         private const val MAX_BASELINE_ARM_ATTEMPTS: Int = 3
+
+        // GAME-1236 — minimum wireframe nodes for a decor view to count as a content window.
+        // A real screen here has 20-250; the editor library's lone-image selection/drag
+        // overlays have ~1. Unlike a size threshold this also catches a full-screen drag layer.
+        private const val MIN_CONTENT_WINDOW_NODES: Int = 12
+
+        // GAME-1236 — minimum wireframe height (dp) for a full-screen content window. Content
+        // screens are ~850dp; modal dialogs are <=~280dp, so this drops floating dialogs while
+        // keeping every real screen (including the ~777dp system share sheet).
+        private const val MIN_FULLSCREEN_HEIGHT_DP: Int = 500
 
         private val integrationInstalled = AtomicBoolean(false)
     }
