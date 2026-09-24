@@ -71,6 +71,7 @@ import com.posthog.android.replay.internal.BaselineResult
 import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.IncrementalMutationDedup
 import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
@@ -768,9 +769,15 @@ public class PostHogReplayIntegration(
                 lastSnapshots.flattenChildren(),
                 listOf(current).flattenChildren(),
             )
-        val addedNodes = addedItems.map { RRMutatedNode(it, parentId = it.parentId) }
+        // GAME-1315 — the diff runs on a FLATTENED tree but each entry is emitted with its whole
+        // subtree, so a node is serialized once for itself and once inside every changed ancestor
+        // (~13x on a scrolling image grid, which is what pushes the event past the 413 ceiling).
+        // Keep only the top-most entries; the player flattens and dedupes by id anyway, so the
+        // ancestor's copy is the same node. See IncrementalMutationDedup for why entries are
+        // dropped whole rather than having their children stripped.
+        val addedNodes = IncrementalMutationDedup.dropCovered(addedItems).map { RRMutatedNode(it, parentId = it.parentId) }
         val removedNodes = removedItems.map { RRRemovedNode(it.id, parentId = it.parentId) }
-        val updatedNodes = updatedItems.map { RRMutatedNode(it, parentId = it.parentId) }
+        val updatedNodes = IncrementalMutationDedup.dropCovered(updatedItems).map { RRMutatedNode(it, parentId = it.parentId) }
         if (addedNodes.isEmpty() && removedNodes.isEmpty() && updatedNodes.isEmpty()) {
             return null
         }
