@@ -73,6 +73,8 @@ import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
+import com.posthog.android.replay.internal.IncrementalMutationDedup
+import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -127,6 +129,20 @@ public class PostHogReplayIntegration(
     // Guarded by decorViews, together with snapshot-state commits. Stop/resume in the same
     // session must invalidate work too, so session identity alone is not a sufficient lease.
     private var snapshotGeneration: Long = 0
+
+    // GAME-1315 — how much base64 image payload the snapshot currently being built may still
+    // carry. Reset at the top of every generateSnapshot pass and spent by Drawable.base64 as
+    // the tree is walked, so one screen full of images cannot inflate the request batch past
+    // the size at which ingest drops it. Touched only on the single-threaded snapshot executor.
+    private val imageBudget = ReplayImageBudget()
+
+    // GAME-1236 — which decor view's full snapshot is the live document for the shared
+    // $window_id. When another content window takes over (editor -> share -> back to editor),
+    // its per-view sentFullSnapshot is still true, so it would emit INCREMENTAL mutations
+    // against a document that is no longer its own and orphan every node. Tracking ownership
+    // lets us re-emit a full instead. WeakReference so a destroyed decor view is never pinned.
+    @Volatile
+    private var currentDocumentOwner: WeakReference<View>? = null
 
     private val passwordInputTypes =
         setOf(
@@ -759,6 +775,14 @@ public class PostHogReplayIntegration(
     // internal (not private) so tests can drive a snapshot pass directly.
     // Returns whether a frame was actually produced (false on every early bail),
     // so the bridge caller can tell "captured" from "silently skipped".
+    // Total wireframe nodes in a subtree (root plus all descendants). Tells a real content
+    // window from a lone-image overlay (GAME-1236 / posthog-android#752).
+    private fun subtreeNodeCount(wireframe: RRWireframe): Int {
+        var count = 1
+        wireframe.childWireframes?.forEach { count += subtreeNodeCount(it) }
+        return count
+    }
+
     internal fun generateSnapshot(
         viewRef: WeakReference<View>,
         windowRef: WeakReference<Window>,
@@ -782,6 +806,10 @@ public class PostHogReplayIntegration(
         val timestamp = config.dateProvider.currentTimeMillis()
 
         val useScreenshot = config.sessionReplayConfig.screenshot || forceScreenshot
+
+        // GAME-1315 — each snapshot gets its own image allowance. Must be reset BEFORE the
+        // tree walk below, which is what spends it.
+        imageBudget.reset()
         val wireframe =
             if (useScreenshot) {
                 view.toScreenshotWireframe(
@@ -791,6 +819,22 @@ public class PostHogReplayIntegration(
             } else {
                 view.toWireframe() ?: return false
             }
+
+        // GAME-1236 (regressed by the 1277 re-cut, restored here) — in wireframe mode capture
+        // ONLY full-screen, content-rich windows. Every Android decor view is snapshotted under
+        // the SAME $window_id, and the web player keeps one rrweb document per id, so any
+        // secondary window's FULL snapshot replaces the document the editor is drawing into and
+        // every later editor mutation is orphaned -- the replay freezes on the last good frame.
+        // Height separates a full-screen Activity from a floating dialog; node count separates it
+        // from the editor library's lone-image selection/drag overlays. Real dialogs here render
+        // in-layout, so dropping the separate ones loses no content. Screenshot mode is exempt:
+        // there each snapshot is a whole-screen bitmap with no shared document to stomp.
+        if (!useScreenshot) {
+            val nodeCount = subtreeNodeCount(wireframe)
+            if (wireframe.height < MIN_FULLSCREEN_HEIGHT_DP || nodeCount < MIN_CONTENT_WINDOW_NODES) {
+                return false
+            }
+        }
 
         // if the decorView has no backgroundColor, we use the theme color
         // no need to do this if we are capturing a screenshot
@@ -853,7 +897,10 @@ public class PostHogReplayIntegration(
             status.sentMetaEvent = true
         }
 
-        if (!status.sentFullSnapshot) {
+        // GAME-1236 — re-anchor when a DIFFERENT content window now owns the shared document.
+        // Emitting an incremental here would diff against another window's document.
+        val ownsDocument = currentDocumentOwner?.get() === view
+        if (!status.sentFullSnapshot || !ownsDocument) {
             val event =
                 RRFullSnapshotEvent(
                     listOf(wireframe),
@@ -863,6 +910,7 @@ public class PostHogReplayIntegration(
                 )
             events.add(event)
             status.sentFullSnapshot = true
+            currentDocumentOwner = WeakReference(view)
         } else {
             val lastSnapshot = status.lastSnapshot
             val lastSnapshots = if (lastSnapshot != null) listOf(lastSnapshot) else emptyList()
@@ -872,8 +920,15 @@ public class PostHogReplayIntegration(
                     listOf(wireframe).flattenChildren(),
                 )
 
+            // GAME-1315 — the diff runs on a FLATTENED tree but each entry is emitted with
+            // its whole subtree, so a node is serialized once for itself and once inside every
+            // changed ancestor (~13x on a scrolling image grid). That inflates the request batch
+            // until ingest drops it, taking the establishing full snapshot with it. Keep only the
+            // top-most entries; the player flattens and dedupes by id anyway, so the ancestor's
+            // copy IS the same node. See IncrementalMutationDedup for why entries are dropped
+            // whole rather than having their children stripped.
             val addedNodes = mutableListOf<RRMutatedNode>()
-            addedItems.forEach {
+            IncrementalMutationDedup.dropCovered(addedItems).forEach {
                 val item = RRMutatedNode(it, parentId = it.parentId)
                 addedNodes.add(item)
             }
@@ -885,7 +940,7 @@ public class PostHogReplayIntegration(
             }
 
             val updatedNodes = mutableListOf<RRMutatedNode>()
-            updatedItems.forEach {
+            IncrementalMutationDedup.dropCovered(updatedItems).forEach {
                 val item = RRMutatedNode(it, parentId = it.parentId)
                 updatedNodes.add(item)
             }
@@ -2289,14 +2344,33 @@ public class PostHogReplayIntegration(
         return null
     }
 
+    /**
+     * GAME-1315 — the ONLY accounted entry point for encoding a drawable into a wireframe.
+     *
+     * The encode happens at the drawable's on-screen size under a hard dimension cap, and the
+     * resulting base64 is charged against [imageBudget]. Past the budget the caller gets null,
+     * so the wireframe node ships without pixels rather than inflating the request batch to the
+     * size at which ingest silently drops it. The recursive Layer/Inset cases below deliberately
+     * call [base64Unbounded]: a composite drawable is ONE image and must be charged once.
+     */
     private fun Drawable.base64(
+        width: Int,
+        height: Int,
+        cloned: Boolean = false,
+    ): String? {
+        if (imageBudget.exhausted()) return null
+        val encoded = base64Unbounded(width, height, cloned) ?: return null
+        return if (imageBudget.charge(encoded.length)) encoded else null
+    }
+
+    private fun Drawable.base64Unbounded(
         width: Int,
         height: Int,
         cloned: Boolean = false,
     ): String? {
         val convertedBitmap = runDrawableConverter(this)
         if (convertedBitmap != null) {
-            return convertedBitmap.webpBase64()
+            return convertedBitmap.replayBase64(width, height)
         }
 
         var clonedDrawable = this
@@ -2307,7 +2381,7 @@ public class PostHogReplayIntegration(
         when (clonedDrawable) {
             is BitmapDrawable -> {
                 try {
-                    return clonedDrawable.bitmap.webpBase64()
+                    return clonedDrawable.bitmap.replayBase64(width, height)
                 } catch (_: Throwable) {
                     // ignore
                 }
@@ -2315,19 +2389,22 @@ public class PostHogReplayIntegration(
 
             is LayerDrawable -> {
                 clonedDrawable.getFirstDrawable()?.let {
-                    return it.base64(width, height)
+                    return it.base64Unbounded(width, height)
                 }
             }
 
             is InsetDrawable -> {
                 clonedDrawable.drawable?.let {
-                    return it.base64(width, height)
+                    return it.base64Unbounded(width, height)
                 }
             }
         }
 
         try {
-            val bitmap = clonedDrawable.toBitmap(width, height)
+            // toBitmap rasterizes at the requested size, but that size is the on-SCREEN box and
+            // so grows with the display; cap it the same way.
+            val (capWidth, capHeight) = ReplayImageBudget.scaledSize(width, height, width, height)
+            val bitmap = clonedDrawable.toBitmap(capWidth, capHeight)
             val base64 = bitmap.webpBase64()
             bitmap.recycle()
             return base64
@@ -2335,6 +2412,37 @@ public class PostHogReplayIntegration(
             // ignore
         }
         return null
+    }
+
+    /**
+     * GAME-1315 — encodes at the size the bitmap is DRAWN at, not the size it was decoded at.
+     *
+     * A 300x300 sticker asset in a 120x120 grid cell used to ship all 300x300 pixels, and a
+     * denser screen enlarged every such blob at once -- which is why the same drive went white
+     * on a flagship and not on the emulator. Never upscales, and falls through to the source
+     * bitmap unchanged when it already fits, so the common small-icon case is free.
+     */
+    private fun Bitmap.replayBase64(
+        boxWidth: Int,
+        boxHeight: Int,
+    ): String? {
+        val (targetWidth, targetHeight) = ReplayImageBudget.scaledSize(width, height, boxWidth, boxHeight)
+        if (targetWidth == width && targetHeight == height) {
+            return webpBase64()
+        }
+        var scaled: Bitmap? = null
+        return try {
+            scaled = Bitmap.createScaledBitmap(this, targetWidth, targetHeight, true)
+            scaled.webpBase64()
+        } catch (_: Throwable) {
+            // A failed downscale must not lose the image; ship the source instead.
+            webpBase64()
+        } finally {
+            // createScaledBitmap can return the receiver itself when nothing changed.
+            if (scaled !== this && scaled?.isRecycled == false) {
+                scaled.recycle()
+            }
+        }
     }
 
     private fun LayerDrawable.getFirstDrawable(): Drawable? {
@@ -2585,6 +2693,10 @@ public class PostHogReplayIntegration(
                 resetViewSnapshotStates(it.value)
             }
         }
+        // GAME-1236 — drop document ownership too, so the next capture re-anchors with a fresh
+        // full. Leaving a stale owner here would let the next draw emit an incremental against a
+        // document that was just discarded.
+        currentDocumentOwner = null
     }
 
     override fun stop() {
@@ -3045,6 +3157,16 @@ public class PostHogReplayIntegration(
         // Pre-walk re-arm attempts per capture: a screen that redraws during every attempt
         // discards this tick and retries at the next scheduled snapshot.
         private const val MAX_BASELINE_ARM_ATTEMPTS: Int = 3
+
+        // GAME-1236 — minimum wireframe nodes for a decor view to count as a content window.
+        // A real screen here has 20-250; the editor library's lone-image selection/drag
+        // overlays have ~1. Unlike a size threshold this also catches a full-screen drag layer.
+        private const val MIN_CONTENT_WINDOW_NODES: Int = 12
+
+        // GAME-1236 — minimum wireframe height (dp) for a full-screen content window. Content
+        // screens are ~850dp; modal dialogs are <=~280dp, so this drops floating dialogs while
+        // keeping every real screen (including the ~777dp system share sheet).
+        private const val MIN_FULLSCREEN_HEIGHT_DP: Int = 500
 
         private val integrationInstalled = AtomicBoolean(false)
     }
