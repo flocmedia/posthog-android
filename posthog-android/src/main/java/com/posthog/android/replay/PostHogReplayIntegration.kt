@@ -71,6 +71,7 @@ import com.posthog.android.replay.internal.BaselineResult
 import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -143,6 +144,12 @@ public class PostHogReplayIntegration(
     // clearSnapshotStates; a WeakReference so it never pins a destroyed decor view.
     @Volatile
     private var currentDocumentOwner: WeakReference<View>? = null
+
+    // GAME-1315 — how much base64 image payload the snapshot currently being built may still
+    // carry. Reset at the top of every generateSnapshot pass and spent by Drawable.base64 as
+    // the tree is walked, so one screen full of images cannot produce an event large enough to
+    // take a 413 and be deleted. Touched only on the single-threaded snapshot executor.
+    private val imageBudget = ReplayImageBudget()
 
     private val passwordInputTypes =
         setOf(
@@ -799,6 +806,10 @@ public class PostHogReplayIntegration(
         val timestamp = config.dateProvider.currentTimeMillis()
 
         val useScreenshot = config.sessionReplayConfig.screenshot || forceScreenshot
+
+        // GAME-1315 — each snapshot gets its own image allowance. Must be reset BEFORE the tree
+        // walk below, which is what spends it.
+        imageBudget.reset()
 
         val wireframe =
             if (useScreenshot) {
@@ -2011,14 +2022,35 @@ public class PostHogReplayIntegration(
         return null
     }
 
+    /**
+     * GAME-1315 — the ONLY entry point for encoding a drawable into a wireframe.
+     *
+     * Everything an image costs the snapshot is accounted for here: the encode happens at
+     * the drawable's on-screen size under a hard dimension cap, and the resulting base64 is
+     * charged against [imageBudget]. Past the budget the caller gets null, so the wireframe
+     * node ships without pixels rather than the whole event taking a 413 and being deleted
+     * (see ReplayImageBudget's header for the chain). The recursive Layer/Inset cases below
+     * deliberately call [base64Unbounded], not this: a composite drawable is ONE image and
+     * must be charged once, at the size it occupies.
+     */
     private fun Drawable.base64(
+        width: Int,
+        height: Int,
+        cloned: Boolean = false,
+    ): String? {
+        if (imageBudget.exhausted()) return null
+        val encoded = base64Unbounded(width, height, cloned) ?: return null
+        return if (imageBudget.charge(encoded.length)) encoded else null
+    }
+
+    private fun Drawable.base64Unbounded(
         width: Int,
         height: Int,
         cloned: Boolean = false,
     ): String? {
         val convertedBitmap = runDrawableConverter(this)
         if (convertedBitmap != null) {
-            return convertedBitmap.webpBase64()
+            return convertedBitmap.replayBase64(width, height)
         }
 
         var clonedDrawable = this
@@ -2029,7 +2061,7 @@ public class PostHogReplayIntegration(
         when (clonedDrawable) {
             is BitmapDrawable -> {
                 try {
-                    return clonedDrawable.bitmap.webpBase64()
+                    return clonedDrawable.bitmap.replayBase64(width, height)
                 } catch (_: Throwable) {
                     // ignore
                 }
@@ -2037,19 +2069,22 @@ public class PostHogReplayIntegration(
 
             is LayerDrawable -> {
                 clonedDrawable.getFirstDrawable()?.let {
-                    return it.base64(width, height)
+                    return it.base64Unbounded(width, height)
                 }
             }
 
             is InsetDrawable -> {
                 clonedDrawable.drawable?.let {
-                    return it.base64(width, height)
+                    return it.base64Unbounded(width, height)
                 }
             }
         }
 
         try {
-            val bitmap = clonedDrawable.toBitmap(width, height)
+            // toBitmap already rasterizes at the requested size, but that size is the
+            // on-SCREEN box and so grows with the display; cap it the same way.
+            val (capWidth, capHeight) = ReplayImageBudget.scaledSize(width, height, width, height)
+            val bitmap = clonedDrawable.toBitmap(capWidth, capHeight)
             val base64 = bitmap.webpBase64()
             bitmap.recycle()
             return base64
@@ -2057,6 +2092,37 @@ public class PostHogReplayIntegration(
             // ignore
         }
         return null
+    }
+
+    /**
+     * Encodes at the size the bitmap is DRAWN at, not the size it was decoded at.
+     *
+     * A 300x300 sticker asset in a 120x120 grid cell used to ship all 300x300 pixels, and a
+     * denser screen enlarged every such blob at once -- which is why the same drive went
+     * white on a flagship and not on the emulator. Never upscales, and falls through to the
+     * source bitmap unchanged when it already fits, so the common small-icon case is free.
+     */
+    private fun Bitmap.replayBase64(
+        boxWidth: Int,
+        boxHeight: Int,
+    ): String? {
+        val (targetWidth, targetHeight) = ReplayImageBudget.scaledSize(width, height, boxWidth, boxHeight)
+        if (targetWidth == width && targetHeight == height) {
+            return webpBase64()
+        }
+        var scaled: Bitmap? = null
+        return try {
+            scaled = Bitmap.createScaledBitmap(this, targetWidth, targetHeight, true)
+            scaled.webpBase64()
+        } catch (_: Throwable) {
+            // A failed downscale must not lose the image; ship the source instead.
+            webpBase64()
+        } finally {
+            // createScaledBitmap can return the receiver itself when nothing changed.
+            if (scaled !== this && scaled?.isRecycled == false) {
+                scaled.recycle()
+            }
+        }
     }
 
     private fun LayerDrawable.getFirstDrawable(): Drawable? {
