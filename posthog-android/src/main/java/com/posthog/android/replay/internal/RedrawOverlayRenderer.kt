@@ -2,6 +2,8 @@ package com.posthog.android.replay.internal
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Rect
+import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
 import android.view.View
@@ -12,19 +14,36 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Renders the views marked with [PostHogRedrawOverMask] into a transparent bitmap laid out
- * exactly like the captured window, for compositing over a masked screenshot.
+ * Screenshot mode: renders what sits IN FRONT of the masks into a transparent bitmap laid out
+ * like the captured window, for compositing over the masked screenshot.
  *
- * `View.draw` must run on the main thread, but screenshot capture and masking run off it. So
- * the render is posted to main and awaited briefly; on timeout the caller gets null and the
- * frame is simply masked as usual. The bitmap is owned by whichever side finishes last, so
- * it is never recycled while the main thread is still drawing into it.
+ * Which views are redrawn:
+ *  - OUTSIDE a masked view's container: every view drawn after a mask (in draw order,
+ *    Z-sorted like the framework) is redrawn automatically -- sheets, panels, in-layout
+ *    dialogs, toolbars. This is what stops a photo mask from blacking out the UI in front.
+ *  - INSIDE a masked view's container: only views marked with [PostHogRedrawOverMask]. That
+ *    container is where untagged copies of the sensitive pixels live (a filtered copy, a
+ *    blurred background); they are hidden today only because they fall inside the mask's
+ *    rectangle, so they must never be redrawn automatically.
+ *
+ * Masked content inside a redrawn subtree is masked AGAIN on the overlay (the same pattern),
+ * so e.g. a sheet holding one masked thumbnail still shows, with only the thumbnail hidden.
+ * A subtree whose masking cannot be located (Compose) is not redrawn at all.
+ *
+ * `View.draw` must run on the main thread; capture and masking do not. The render is posted
+ * to main and awaited briefly; on timeout the caller gets null and the frame is a plain
+ * masked screenshot -- never a less private one.
  */
 internal class RedrawOverlayRenderer(
     private val mainHandler: Handler,
-    private val isNoCapture: (View) -> Boolean,
+    /** Mirrors the mask walk: true for any view the walk would mask. */
+    private val isMasked: (View) -> Boolean,
+    /** True for views whose masked children cannot be located (e.g. Compose): never redrawn. */
+    private val isOpaqueToMasking: (View) -> Boolean = { false },
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
 ) {
+    private val painter = ScreenshotMaskPainter()
+
     fun render(
         root: View,
         bitmapWidth: Int,
@@ -32,15 +51,10 @@ internal class RedrawOverlayRenderer(
         sourceWidth: Int,
         sourceHeight: Int,
     ): Bitmap? {
-        if (PostHogRedrawOverMask.isEmpty() || bitmapWidth <= 0 || bitmapHeight <= 0 ||
-            sourceWidth <= 0 || sourceHeight <= 0
-        ) {
-            return null
-        }
+        if (bitmapWidth <= 0 || bitmapHeight <= 0 || sourceWidth <= 0 || sourceHeight <= 0) return null
         if (Looper.myLooper() == Looper.getMainLooper()) {
             return renderOnMain(root, bitmapWidth, bitmapHeight, sourceWidth, sourceHeight)
         }
-
         val latch = CountDownLatch(1)
         val abandoned = AtomicBoolean(false)
         var result: Bitmap? = null
@@ -51,14 +65,8 @@ internal class RedrawOverlayRenderer(
                 } catch (_: Throwable) {
                     null
                 }
-            // Whoever loses the race owns cleanup: if the waiter already gave up, nobody
-            // else will ever read this bitmap.
             synchronized(abandoned) {
-                if (abandoned.get()) {
-                    rendered?.recycle()
-                } else {
-                    result = rendered
-                }
+                if (abandoned.get()) rendered?.recycle() else result = rendered
             }
             latch.countDown()
         }
@@ -78,6 +86,18 @@ internal class RedrawOverlayRenderer(
         }
     }
 
+    private class Walk {
+        val maskContainers = HashSet<ViewGroup>()
+        var maskSeen = false
+        val remask = mutableListOf<Rect>()
+        var drew = false
+
+        // Window position of the walk root. Re-mask rects come from getGlobalVisibleRect (window
+        // coordinates) but the overlay is laid out relative to the root; for a decor view the
+        // offset is zero, but never assume that.
+        val rootOffset = IntArray(2)
+    }
+
     private fun renderOnMain(
         root: View,
         bitmapWidth: Int,
@@ -86,45 +106,74 @@ internal class RedrawOverlayRenderer(
         sourceHeight: Int,
     ): Bitmap? {
         if (!root.isAttachedToWindow) return null
+        val walk = Walk()
+        root.getLocationInWindow(walk.rootOffset)
+        // Pre-pass: containers of every visible masked view. Needed up front so a sibling drawn
+        // BEFORE the masked view (e.g. a background copy of the photo) is still classified as
+        // inside the container, whatever other masks appeared earlier in the tree.
+        collectMaskContainers(root, walk)
+        if (walk.maskContainers.isEmpty()) return null
+
         val bitmap = Bitmap.createBitmap(bitmapWidth, bitmapHeight, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bitmap)
-        canvas.scale(bitmapWidth.toFloat() / sourceWidth, bitmapHeight.toFloat() / sourceHeight)
-        var drewAnything = false
+        val sx = bitmapWidth.toFloat() / sourceWidth
+        val sy = bitmapHeight.toFloat() / sourceHeight
         try {
-            drewAnything = walk(root, canvas)
+            val canvas = Canvas(bitmap)
+            canvas.scale(sx, sy)
+            walk(root, canvas, walk, insideContainer = false)
+            if (walk.remask.isNotEmpty()) {
+                val c = Canvas(bitmap)
+                c.scale(sx, sy)
+                for (r in walk.remask) painter.draw(c, RectF(r), 10f, 10f, 1f)
+            }
         } catch (_: Throwable) {
-            drewAnything = false
+            bitmap.recycle()
+            return null
         }
-        if (!drewAnything) {
+        if (!walk.drew) {
             bitmap.recycle()
             return null
         }
         return bitmap
     }
 
-    /**
-     * Depth-first in drawing order, carrying the same transform the framework applies:
-     * each child is translated by its layout position minus the parent's scroll, then by its
-     * own matrix (translation / scale / rotation about its pivot), and clipped to the parent
-     * when the parent clips its children. A marked view draws its whole subtree and stops the
-     * descent; nothing unmarked is ever drawn.
-     */
+    private fun collectMaskContainers(
+        view: View,
+        walk: Walk,
+    ) {
+        if (view.visibility != View.VISIBLE) return
+        if (isMasked(view)) {
+            (view.parent as? ViewGroup)?.let { walk.maskContainers.add(it) }
+            return
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) view.getChildAt(i)?.let { collectMaskContainers(it, walk) }
+        }
+    }
+
     private fun walk(
         view: View,
         canvas: Canvas,
-    ): Boolean {
-        if (view.visibility != View.VISIBLE || view.alpha <= 0f) return false
-        if (PostHogRedrawOverMask.isMarked(view)) {
-            // Fail closed: a marked view must never smuggle a masked view back into the frame.
-            if (containsNoCapture(view)) return false
-            view.draw(canvas)
-            return true
+        walk: Walk,
+        insideContainer: Boolean,
+    ) {
+        if (view.visibility != View.VISIBLE || view.alpha <= 0f) return
+        if (isMasked(view)) {
+            walk.maskSeen = true // never drawn; everything after it is "in front"
+            return
         }
-        if (view !is ViewGroup) return false
+        val redraw = PostHogRedrawOverMask.isMarked(view) || (walk.maskSeen && !insideContainer)
+        if (redraw) {
+            if (isOpaqueToMasking(view) || containsOpaque(view)) return
+            view.draw(canvas)
+            walk.drew = true
+            collectMasked(view, walk)
+            return
+        }
+        if (view !is ViewGroup) return
 
-        var drew = false
-        for (i in 0 until view.childCount) {
-            val child = view.getChildAt(i) ?: continue
+        val childInside = insideContainer || view in walk.maskContainers
+        for (child in zOrderedChildren(view)) {
             if (child.visibility != View.VISIBLE || child.alpha <= 0f) continue
             val save = canvas.save()
             try {
@@ -137,20 +186,43 @@ internal class RedrawOverlayRenderer(
                 if (child.alpha < 1f) {
                     canvas.saveLayerAlpha(0f, 0f, child.width.toFloat(), child.height.toFloat(), (child.alpha * 255).toInt())
                 }
-                if (walk(child, canvas)) drew = true
+                walk(child, canvas, walk, childInside)
             } finally {
                 canvas.restoreToCount(save)
             }
         }
-        return drew
     }
 
-    private fun containsNoCapture(view: View): Boolean {
-        if (isNoCapture(view)) return true
+    // Framework draw order: index order, stably re-sorted by Z (elevation + translationZ).
+    private fun zOrderedChildren(group: ViewGroup): List<View> {
+        val children = (0 until group.childCount).mapNotNull { group.getChildAt(it) }
+        return if (children.any { it.z != 0f }) children.sortedBy { it.z } else children
+    }
+
+    private fun collectMasked(
+        view: View,
+        walk: Walk,
+    ) {
+        if (view.visibility != View.VISIBLE) return
+        if (isMasked(view)) {
+            val r = Rect()
+            if (view.getGlobalVisibleRect(r)) {
+                r.offset(-walk.rootOffset[0], -walk.rootOffset[1])
+                walk.remask.add(r)
+            }
+            return
+        }
+        if (view is ViewGroup) {
+            for (i in 0 until view.childCount) view.getChildAt(i)?.let { collectMasked(it, walk) }
+        }
+    }
+
+    private fun containsOpaque(view: View): Boolean {
+        if (isOpaqueToMasking(view)) return true
         if (view is ViewGroup) {
             for (i in 0 until view.childCount) {
-                val child = view.getChildAt(i) ?: continue
-                if (containsNoCapture(child)) return true
+                val c = view.getChildAt(i) ?: continue
+                if (containsOpaque(c)) return true
             }
         }
         return false

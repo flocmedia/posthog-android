@@ -1,6 +1,7 @@
 package com.posthog.android.replay.internal
 
 import android.app.Activity
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Handler
 import android.os.Looper
@@ -17,109 +18,142 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
- * Redraw-over-mask renders ONLY marked views, at their on-screen position, and never a
- * marked view that would smuggle a `ph-no-capture` view back into the frame.
+ * Screen, back to front:
+ *   behind  (outside the photo's container, drawn BEFORE the mask)        -> never redrawn
+ *   canvas  = photo(masked) + photoCopy(unmarked) + sticker(marked)        -> only the sticker
+ *   sheet   (outside the container, drawn AFTER the mask) + thumb(masked)  -> redrawn, thumb re-masked
  *
  * MUTATION EVIDENCE — each edit applied to RedrawOverlayRenderer.kt, test watched go red:
- *  M1  drop the `if (containsNoCapture(view)) return false` guard
- *      => aMarkedViewHoldingAMaskedViewIsNotDrawn FAILS: the masked child's pixels come back.
- *  M2  in walk(), draw every VISIBLE view instead of only marked ones
- *      => anUnmarkedSiblingIsNeverDrawn FAILS: the allowlist becomes a denylist, which is
- *      exactly how an untagged copy of the photo would leak.
- *  M3  drop `canvas.translate(child.left - scrollX, child.top - scrollY)`
- *      => aMarkedViewIsDrawnAtItsOnScreenPosition FAILS (drawn at the origin).
+ *  M1  `val redraw = isMarked || (maskSeen && !insideContainer)` -> drop `&& !insideContainer`
+ *      => anUnmarkedCopyInsideThePhotosContainerIsNeverRedrawn FAILS: the photo copy leaks.
+ *  M2  skip the pre-pass (collectMaskContainers) -> containers learned only as the walk meets
+ *      the mask => aBackgroundCopyDrawnBeforeThePhotoIsNeverRedrawn FAILS once an earlier mask
+ *      has set maskSeen.
+ *  M3  drop `collectMasked(view, walk.remask)` => aMaskedThumbnailInsideRedrawnUiIsMaskedAgain
+ *      FAILS: the thumbnail's own pixels come back.
+ *  M4  drop the `walk.maskSeen = true` line => uiInFrontOfTheMaskIsRedrawnAutomatically FAILS.
  */
 @RunWith(AndroidJUnit4::class)
 @Config(sdk = [26])
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 internal class RedrawOverlayRendererTest {
     private val marked = mutableListOf<View>()
+    private val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
 
     @After
-    fun tearDown() {
-        marked.forEach { PostHogRedrawOverMask.unmark(it) }
-    }
+    fun tearDown() = marked.forEach { PostHogRedrawOverMask.unmark(it) }
 
-    private fun mark(v: View) {
-        PostHogRedrawOverMask.mark(v)
-        marked.add(v)
+    private val PHOTO = Color.BLUE
+    private val COPY = Color.GREEN
+    private val STICKER = Color.RED
+    private val SHEET = Color.MAGENTA
+    private val THUMB = Color.CYAN
+    private val BEHIND = Color.DKGRAY
+
+    private fun box(color: Int, l: Int, t: Int, w: Int, h: Int, masked: Boolean = false) =
+        View(activity).apply {
+            setBackgroundColor(color)
+            layoutParams = FrameLayout.LayoutParams(w, h).apply { leftMargin = l; topMargin = t }
+            if (masked) tag = "ph-no-capture"
+        }
+
+    private fun group(l: Int, t: Int, w: Int, h: Int, vararg kids: View) =
+        FrameLayout(activity).apply {
+            layoutParams = FrameLayout.LayoutParams(w, h).apply { leftMargin = l; topMargin = t }
+            kids.forEach { addView(it) }
+        }
+
+    private class Scene(val root: FrameLayout, val sticker: View)
+
+    private fun scene(withEarlierMask: Boolean = false): Scene {
+        val sticker = box(STICKER, 50, 50, 20, 20)
+        val canvas = group(0, 0, 200, 200,
+            box(COPY, 0, 0, 200, 200),                     // background copy, BEFORE the photo
+            box(PHOTO, 0, 0, 200, 200, masked = true),     // the photo
+            box(COPY, 150, 60, 40, 40),                    // filtered copy, AFTER the photo
+            sticker,
+        )
+        val sheet = group(0, 120, 200, 80, box(SHEET, 0, 0, 200, 80), box(THUMB, 10, 10, 30, 30, masked = true))
+        val root = FrameLayout(activity)
+        // A mask elsewhere, earlier in draw order, in its OWN parent -- so it sets maskSeen without
+        // making the whole root a mask container (which would, correctly, disable auto-redraw).
+        if (withEarlierMask) root.addView(group(0, 0, 1, 1, box(Color.BLACK, 0, 0, 1, 1, masked = true)))
+        root.addView(box(BEHIND, 100, 0, 100, 40))
+        root.addView(canvas)
+        root.addView(sheet)
+        activity.setContentView(root)
+        root.measure(View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY))
+        root.layout(0, 0, 200, 200)
+        return Scene(root, sticker)
     }
 
     private fun renderer() =
-        RedrawOverlayRenderer(Handler(Looper.getMainLooper()), isNoCapture = { v ->
-            (v.tag as? String)?.contains("ph-no-capture") == true
-        })
+        RedrawOverlayRenderer(Handler(Looper.getMainLooper()), isMasked = { v -> (v.tag as? String)?.contains("ph-no-capture") == true })
 
-    private fun box(
-        color: Int,
-        left: Int,
-        top: Int,
-        size: Int,
-    ): View {
-        val v = View(Robolectric.buildActivity(Activity::class.java).get())
-        v.setBackgroundColor(color)
-        v.layoutParams = FrameLayout.LayoutParams(size, size).apply { leftMargin = left; topMargin = top }
-        return v
-    }
+    private fun render(s: Scene): Bitmap = assertNotNull(renderer().render(s.root, 200, 200, 200, 200))
 
-    private fun rootWith(vararg children: View): FrameLayout {
-        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-        val root = FrameLayout(activity)
-        children.forEach { (it.parent as? FrameLayout)?.removeView(it); root.addView(it) }
-        activity.setContentView(root)
-        root.measure(
-            View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY),
-            View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY),
-        )
-        root.layout(0, 0, 200, 200)
-        return root
-    }
+    private fun isPattern(c: Int) = c == ScreenshotMaskPainter.ORANGE || c == ScreenshotMaskPainter.BLUE || c == ScreenshotMaskPainter.YELLOW
 
     @Test
-    fun nothingMarkedRendersNothing() {
-        val root = rootWith(box(Color.RED, 10, 10, 20))
+    fun nothingMaskedRendersNothing() {
+        val root = FrameLayout(activity).apply { addView(box(STICKER, 0, 0, 20, 20)) }
+        activity.setContentView(root)
+        root.measure(View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(200, View.MeasureSpec.EXACTLY))
+        root.layout(0, 0, 200, 200)
         assertNull(renderer().render(root, 200, 200, 200, 200))
     }
 
     @Test
-    fun aMarkedViewIsDrawnAtItsOnScreenPosition() {
-        val sticker = box(Color.RED, 50, 60, 20)
-        val root = rootWith(sticker)
-        mark(sticker)
-
-        val out = assertNotNull(renderer().render(root, 200, 200, 200, 200))
-
-        assertEquals(Color.RED, out.getPixel(55, 65), "inside the sticker's on-screen bounds")
-        assertEquals(Color.TRANSPARENT, out.getPixel(5, 5), "nothing drawn outside it")
+    fun aMarkedStickerInsideTheContainerIsRedrawnInPlace() {
+        val s = scene().also { PostHogRedrawOverMask.mark(it.sticker); marked += it.sticker }
+        assertEquals(STICKER, render(s).getPixel(55, 55))
     }
 
     @Test
-    fun anUnmarkedSiblingIsNeverDrawn() {
-        val photoCopy = box(Color.BLUE, 0, 0, 200) // e.g. an untagged filtered copy of the photo
-        val sticker = box(Color.RED, 50, 60, 20)
-        val root = rootWith(photoCopy, sticker)
-        mark(sticker)
-
-        val out = assertNotNull(renderer().render(root, 200, 200, 200, 200))
-
-        assertEquals(Color.TRANSPARENT, out.getPixel(150, 150), "the unmarked sibling must not be redrawn")
-        assertEquals(Color.RED, out.getPixel(55, 65))
+    fun anUnmarkedCopyInsideThePhotosContainerIsNeverRedrawn() {
+        val s = scene().also { PostHogRedrawOverMask.mark(it.sticker); marked += it.sticker }
+        val out = render(s)
+        assertTrue(out.getPixel(170, 80) != COPY, "the filtered copy drawn AFTER the photo must not be redrawn")
+        assertTrue(out.getPixel(10, 100) != COPY, "nor the background copy drawn BEFORE it")
     }
 
     @Test
-    fun aMarkedViewHoldingAMaskedViewIsNotDrawn() {
-        val container = FrameLayout(Robolectric.buildActivity(Activity::class.java).get())
-        container.layoutParams = FrameLayout.LayoutParams(200, 200)
-        val photo = box(Color.BLUE, 0, 0, 200).apply { tag = "ph-no-capture" }
-        container.addView(photo)
-        val root = rootWith(container)
-        mark(container)
+    fun aBackgroundCopyDrawnBeforeThePhotoIsNeverRedrawn() {
+        // An earlier mask elsewhere sets maskSeen before the walk reaches the canvas; without the
+        // pre-pass the background copy would look like UI "in front" and be redrawn.
+        val out = render(scene(withEarlierMask = true))
+        assertTrue(out.getPixel(10, 100) != COPY)
+    }
 
-        assertNull(
-            renderer().render(root, 200, 200, 200, 200),
-            "a marked container that holds a masked view must be skipped, not drawn",
+    @Test
+    fun uiInFrontOfTheMaskIsRedrawnAutomatically() {
+        assertEquals(SHEET, render(scene()).getPixel(100, 180), "the sheet is not marked, yet it is redrawn")
+    }
+
+    @Test
+    fun uiBehindTheMaskIsNotRedrawn() {
+        assertEquals(Color.TRANSPARENT, render(scene()).getPixel(150, 20))
+    }
+
+    @Test
+    fun aMaskedThumbnailInsideRedrawnUiIsMaskedAgain() {
+        val px = render(scene()).getPixel(25, 145) // thumb is at sheet(0,120)+(10,10), 30x30
+        assertTrue(px != THUMB, "the thumbnail's own pixels must not come back")
+        assertTrue(isPattern(px), "it is covered by the mask pattern, got #${Integer.toHexString(px)}")
+    }
+
+    @Test
+    fun aSubtreeWhoseMasksCannotBeLocatedIsNotRedrawn() {
+        val s = scene()
+        val r = RedrawOverlayRenderer(
+            Handler(Looper.getMainLooper()),
+            isMasked = { v -> (v.tag as? String)?.contains("ph-no-capture") == true },
+            isOpaqueToMasking = { v -> (v.background as? android.graphics.drawable.ColorDrawable)?.color == SHEET },
         )
+        val out = r.render(s.root, 200, 200, 200, 200)
+        assertTrue(out == null || out.getPixel(100, 180) != SHEET)
     }
 }

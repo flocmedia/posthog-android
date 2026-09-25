@@ -3678,6 +3678,9 @@ internal class PostHogReplayIntegrationTest {
     // A capturable window with a masked child, so the walks produce a rect to compare.
     private fun screenshotCaptureHarness(enableMaskAlignmentVerification: Boolean = true): ScreenshotCaptureHarness {
         val (fx, fake) = screenshotFixture(enableMaskAlignmentVerification)
+        // These tests place injected changes by counting view-tree visits; the redraw-over-mask
+        // render is a separate traversal (RedrawOverlayRendererTest) and would shift the count.
+        fx.sut.redrawOverMaskEnabled = false
         val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         shadowOf(Looper.getMainLooper()).idle()
         val child = TextView(activity).apply { tag = "ph-no-capture" }

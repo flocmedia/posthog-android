@@ -1,5 +1,6 @@
 package com.posthog.android.replay
 
+import com.posthog.PostHogVisibleForTesting
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.Resources
@@ -204,8 +205,30 @@ public class PostHogReplayIntegration(
     // Screenshot mode: views marked with PostHogRedrawOverMask are re-rendered on the main
     // thread and composited back over the masks, so e.g. stickers stay visible over a masked
     // photo. Lazy because it needs the main handler and most apps never mark anything.
+    // Test seam: the capture-timing tests count view-tree visits to place their injected
+    // changes; the overlay render is a separate traversal, tested on its own.
+    @PostHogVisibleForTesting
+    internal var redrawOverMaskEnabled: Boolean = true
+
     private val redrawOverlay by lazy {
-        RedrawOverlayRenderer(mainHandler.handler, isNoCapture = { v -> v.isNoCapture() })
+        RedrawOverlayRenderer(
+            mainHandler.handler,
+            // Mirror the mask walk's per-view classification, so anything it would mask is
+            // masked again inside redrawn content. ph-no-mask is deliberately NOT honoured
+            // here: ignoring it can only over-mask, never under-mask.
+            isMasked = { v ->
+                v.isNoCapture() ||
+                    (
+                        v is TextView &&
+                            (v.text?.isNotEmpty() == true || v.hint?.isNotEmpty() == true) &&
+                            v.shouldMaskTextView()
+                    ) ||
+                    (v is Spinner && v.shouldMaskSpinner()) ||
+                    (v is ImageView && v.shouldMaskImage()) ||
+                    (v is WebView && v.isAnyInputSensitive())
+            },
+            isOpaqueToMasking = { v -> v.isComposeView() },
+        )
     }
 
     @Volatile
@@ -1892,7 +1915,7 @@ public class PostHogReplayIntegration(
         // render timed out) leaves this a plain masked screenshot -- never a less private one.
         val overlay =
             try {
-                redrawOverlay.render(view, bitmap.width, bitmap.height, sourceWidth, sourceHeight)
+                if (!redrawOverMaskEnabled) null else redrawOverlay.render(view, bitmap.width, bitmap.height, sourceWidth, sourceHeight)
             } catch (e: Throwable) {
                 config.logger.log("Session Replay redraw-over-mask render failed: $e.")
                 null
