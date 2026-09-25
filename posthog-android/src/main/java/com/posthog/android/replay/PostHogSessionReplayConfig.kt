@@ -119,6 +119,15 @@ public class PostHogSessionReplayConfig
         @Volatile
         public var screenshotColorMode: PostHogScreenshotColorMode = PostHogScreenshotColorMode.ARGB_8888
 
+        /**
+         * Called once per process when mask outlines are turned off because collecting them was
+         * too slow on this device (screenshot mode only). [lastCaptureMillis] is the last slow
+         * capture's main-thread cost; [slowCaptures] is how many slow captures in a row it took.
+         * Masking itself is unaffected. Runs on the thread that ran the mask walk -- keep it cheap.
+         */
+        @Volatile
+        public var onMaskOutlinesDisabled: ((lastCaptureMillis: Double, slowCaptures: Int) -> Unit)? = null
+
         init {
             // for keeping back compatibility
             @Suppress("DEPRECATION")

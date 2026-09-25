@@ -19,6 +19,10 @@ import kotlin.test.assertTrue
  *      => exactlyOnBudgetIsNotSlow FAILS.
  *  B5  shouldCollect: drop the `disabled` check
  *      => fourSlowInARowDisablesForGood FAILS.
+ *  B6  record: delete the `onDisabled(...)` call
+ *      => disablingNotifiesOnceWithTheLastCaptureCost FAILS.
+ *  B7  record: let a throwing onDisabled propagate (drop the try/catch)
+ *      => aThrowingCallbackStillDisables FAILS.
  */
 internal class OutlineBudgetTest {
     private val budget = 2_000_000L
@@ -80,6 +84,25 @@ internal class OutlineBudgetTest {
         assertTrue(sut.shouldCollect())
         sut.record(slow)
         assertEquals(List(2) { false } + true, sut.run(3, fast), "the streak restarted at 1: skip 2, not 16")
+    }
+
+    @Test
+    fun disablingNotifiesOnceWithTheLastCaptureCost() {
+        val calls = mutableListOf<Pair<Double, Int>>()
+        val sut = OutlineBudget(budget, onDisabled = { ms, n -> calls.add(ms to n) })
+        sut.run(200, slow)
+        sut.run(50, slow)
+
+        assertEquals(listOf(3.0 to 4), calls)
+    }
+
+    @Test
+    fun aThrowingCallbackStillDisables() {
+        val sut = OutlineBudget(budget, onDisabled = { _, _ -> error("app callback blew up") })
+        sut.run(200, slow)
+
+        assertTrue(sut.disabled)
+        assertFalse(sut.shouldCollect())
     }
 
     @Test

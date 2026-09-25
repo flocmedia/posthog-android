@@ -210,7 +210,11 @@ public class PostHogReplayIntegration(
 
     // Backs outlines off, then off for good, on a device where collecting them is slow.
     @PostHogVisibleForTesting
-    internal var outlineBudget: OutlineBudget = OutlineBudget(log = { config.logger.log(it) })
+    internal var outlineBudget: OutlineBudget =
+        OutlineBudget(
+            log = { config.logger.log(it) },
+            onDisabled = { ms, count -> config.sessionReplayConfig.onMaskOutlinesDisabled?.invoke(ms, count) },
+        )
 
     private fun shouldCollectOutlines(): Boolean = maskOutlinesEnabled && outlineBudget.shouldCollect()
 

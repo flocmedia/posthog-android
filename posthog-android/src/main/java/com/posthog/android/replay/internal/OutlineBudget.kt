@@ -19,6 +19,7 @@ internal class OutlineBudget(
     private val budgetNanos: Long = DEFAULT_BUDGET_NANOS,
     private val disableAfterSlow: Int = DEFAULT_DISABLE_AFTER_SLOW,
     private val log: (String) -> Unit = {},
+    private val onDisabled: (lastCaptureMillis: Double, slowCaptures: Int) -> Unit = { _, _ -> },
 ) {
     private var slowStreak = 0
     private var skipRemaining = 0
@@ -54,6 +55,11 @@ internal class OutlineBudget(
                 "Session Replay mask outlines disabled: $slowStreak captures in a row over " +
                     "${budgetNanos / 1_000_000.0}ms on the main thread.",
             )
+            try {
+                onDisabled(nanos / 1_000_000.0, slowStreak)
+            } catch (e: Throwable) {
+                log("Session Replay onMaskOutlinesDisabled failed: $e.")
+            }
         }
     }
 
