@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Point
 import android.graphics.PorterDuff
 import android.graphics.Rect
@@ -75,6 +76,7 @@ import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.RedrawOverlayRenderer
 import com.posthog.android.replay.internal.ReplayImageBudget
+import com.posthog.android.replay.internal.ScreenshotMaskPainter
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -197,10 +199,7 @@ public class PostHogReplayIntegration(
         displayMetrics.density
     }
 
-    private val paint =
-        Paint().apply {
-            color = Color.BLACK
-        }
+    private val maskPainter = ScreenshotMaskPainter()
 
     // Screenshot mode: views marked with PostHogRedrawOverMask are re-rendered on the main
     // thread and composited back over the masks, so e.g. stickers stay visible over a masked
@@ -1675,7 +1674,7 @@ public class PostHogReplayIntegration(
                 return false
             }
             maskRect.setScaledScreenshotMask(rect, scaleX, scaleY)
-            canvas.drawRoundRect(maskRect, 10f * scaleX, 10f * scaleY, paint)
+            maskPainter.draw(canvas, maskRect, 10f * scaleX, 10f * scaleY, scaleY)
         }
         // Redraw-over-mask: composite the marked views back, but ONLY inside the rectangles
         // just masked. Outside them the screenshot already shows those views, and clipping
@@ -3310,6 +3309,7 @@ public class PostHogReplayIntegration(
 
     internal companion object {
         const val PH_NO_CAPTURE_LABEL: String = "ph-no-capture"
+
         const val PH_NO_MASK_LABEL: String = "ph-no-mask"
         const val ANDROID_COMPOSE_VIEW_CLASS_NAME: String = "androidx.compose.ui.platform.AndroidComposeView"
         const val ANDROID_COMPOSE_VIEW: String = "AndroidComposeView"
