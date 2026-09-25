@@ -75,6 +75,7 @@ import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
+import com.posthog.android.replay.internal.RedrawOverlay
 import com.posthog.android.replay.internal.RedrawOverlayRenderer
 import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ScreenshotMaskPainter
@@ -228,6 +229,7 @@ public class PostHogReplayIntegration(
                     (v is WebView && v.isAnyInputSensitive())
             },
             isOpaqueToMasking = { v -> v.isComposeView() },
+            log = { msg -> config.logger.log(msg) },
         )
     }
 
@@ -1671,7 +1673,7 @@ public class PostHogReplayIntegration(
         sourceWidth: Int,
         sourceHeight: Int,
         canPaintMask: () -> Boolean = { true },
-        overlay: Bitmap? = null,
+        overlay: RedrawOverlay? = null,
     ): Boolean {
         if (!isValid()) {
             this@PostHogReplayIntegration.config.logger.log("Session Replay Bitmap is invalid.")
@@ -1703,7 +1705,7 @@ public class PostHogReplayIntegration(
         // just masked. Outside them the screenshot already shows those views, and clipping
         // keeps this from ever painting anything beyond what the masks cover. Runs strictly
         // after every mask is down, so it cannot reveal the masked pixels beneath.
-        if (overlay != null && !overlay.isRecycled) {
+        if (overlay != null && !overlay.bitmap.isRecycled) {
             for (rect in rects) {
                 if (!canPaintMask()) {
                     return false
@@ -1711,7 +1713,7 @@ public class PostHogReplayIntegration(
                 maskRect.setScaledScreenshotMask(rect, scaleX, scaleY)
                 val save = canvas.save()
                 canvas.clipRect(maskRect)
-                canvas.drawBitmap(overlay, 0f, 0f, null)
+                canvas.drawBitmap(overlay.bitmap, overlay.left, overlay.top, null)
                 canvas.restoreToCount(save)
             }
         }
@@ -1724,7 +1726,7 @@ public class PostHogReplayIntegration(
         armedCapture: ArmedMaskCapture,
         sourceWidth: Int,
         sourceHeight: Int,
-        overlay: Bitmap?,
+        overlay: RedrawOverlay?,
     ): Boolean {
         if (width != sourceWidth || height != sourceHeight) {
             return false
@@ -1758,7 +1760,7 @@ public class PostHogReplayIntegration(
         drawState: WindowDrawState,
         sourceWidth: Int,
         sourceHeight: Int,
-        overlay: Bitmap?,
+        overlay: RedrawOverlay?,
     ): Boolean {
         val unsafeRedraw = {
             width != sourceWidth || height != sourceHeight ||
@@ -1926,7 +1928,7 @@ public class PostHogReplayIntegration(
             try {
                 bitmapLease.release()
             } finally {
-                overlay?.recycle()
+                overlay?.release()
             }
         }
         val latch = CountDownLatch(1)
