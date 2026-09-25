@@ -220,7 +220,7 @@ public class PostHogQueue<Record>(
 
         if (capped.size < files.size) {
             config.logger.log(
-                "Batch capped at ${capped.size} of ${files.size} events (${total} bytes) to stay under the ingest size limit.",
+                "Batch capped at ${capped.size} of ${files.size} events ($total bytes) to stay under the ingest size limit.",
             )
         }
         return capped

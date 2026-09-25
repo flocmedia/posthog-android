@@ -6,7 +6,6 @@ import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
 import android.graphics.Point
 import android.graphics.PorterDuff
 import android.graphics.Rect
@@ -59,6 +58,7 @@ import androidx.core.view.WindowInsetsCompat
 import com.posthog.PostHogEventName
 import com.posthog.PostHogIntegration
 import com.posthog.PostHogInterface
+import com.posthog.PostHogVisibleForTesting
 import com.posthog.android.PostHogAndroidConfig
 import com.posthog.android.internal.MainHandler
 import com.posthog.android.internal.densityValue
@@ -71,9 +71,12 @@ import com.posthog.android.replay.PostHogMaskModifier.PostHogReplayUnmask
 import com.posthog.android.replay.internal.BaselineResult
 import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
+import com.posthog.android.replay.internal.MaskOutlinePainter
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.OutlineCollector
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ReplayImageBudget
+import com.posthog.android.replay.internal.ScreenshotMaskPainter
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -196,10 +199,13 @@ public class PostHogReplayIntegration(
         displayMetrics.density
     }
 
-    private val paint =
-        Paint().apply {
-            color = Color.BLACK
-        }
+    private val maskPainter = ScreenshotMaskPainter()
+    private val outlinePainter = MaskOutlinePainter()
+
+    // Kill switch for outlining views in front of a screenshot mask; tests and measurement
+    // builds flip it to compare against a plain masked frame.
+    @PostHogVisibleForTesting
+    internal var maskOutlinesEnabled: Boolean = true
 
     @Volatile
     private var isSessionReplayActive: Boolean = false
@@ -1091,8 +1097,18 @@ public class PostHogReplayIntegration(
     internal class MaskWalk(
         val failClosed: Boolean = true,
         private val shouldAbort: (() -> Boolean)? = null,
+        // Record outlines of views drawn in front of a mask (see MaskOutlines). Only the walk
+        // whose rects get painted collects them; compare-mode walks stay allocation-free.
+        val collectOutlines: Boolean = false,
     ) {
         val rects: MutableList<Rect> = mutableListOf()
+
+        // Created by the first findMaskableWidgets call on a collecting walk.
+        var outlineCollector: OutlineCollector? = null
+        val outlines: List<FloatArray>
+            get() = outlineCollector?.outlines ?: emptyList()
+        val outlineNanos: Long
+            get() = outlineCollector?.nanos ?: 0L
         var poisoned: Boolean = false
         var aborted: Boolean = false
             private set
@@ -1151,6 +1167,27 @@ public class PostHogReplayIntegration(
         view: View,
         walk: MaskWalk,
     ) {
+        if (!walk.collectOutlines) {
+            findMaskableWidgetsInner(view, walk)
+            return
+        }
+        val collector =
+            walk.outlineCollector ?: OutlineCollector(
+                isStable = { it.isViewStateStableForMatrixOperations() },
+                isOpaque = { it.isComposeView() },
+            ).also { walk.outlineCollector = it }
+        collector.enter(view)
+        try {
+            findMaskableWidgetsInner(view, walk)
+        } finally {
+            collector.exit()
+        }
+    }
+
+    private fun findMaskableWidgetsInner(
+        view: View,
+        walk: MaskWalk,
+    ) {
         if (walk.shouldStop) {
             return
         }
@@ -1159,6 +1196,8 @@ public class PostHogReplayIntegration(
         if (!walk.visitedViews.add(System.identityHashCode(view))) {
             return
         }
+
+        val rectsBefore = walk.rects.size
 
         var walkChildren = false
 
@@ -1210,6 +1249,10 @@ public class PostHogReplayIntegration(
                 walkChildren = true
             }
         }
+
+        // The walk is pre-order in draw order, so once a mask exists every view reached after it
+        // is drawn on top of it.
+        walk.outlineCollector?.consider(view, rectsBefore, walk.rects)
 
         if (walkChildren && view is ViewGroup && view.childCount > 0) {
             for (i in 0 until view.childCount) {
@@ -1534,7 +1577,7 @@ public class PostHogReplayIntegration(
         var armed: ArmedMaskCapture? = null
         for (attempt in 0 until MAX_BASELINE_ARM_ATTEMPTS) {
             val token = drawState.beginMaskCapture()
-            val preWalk = MaskWalk()
+            val preWalk = MaskWalk(collectOutlines = maskOutlinesEnabled)
             try {
                 findMaskableWidgets(view, preWalk)
             } catch (e: Throwable) {
@@ -1640,6 +1683,9 @@ public class PostHogReplayIntegration(
         rects: List<Rect>,
         sourceWidth: Int,
         sourceHeight: Int,
+        outlines: List<FloatArray> = emptyList(),
+        outlineNanos: Long = 0L,
+        density: Float = 1f,
         canPaintMask: () -> Boolean = { true },
     ): Boolean {
         if (!isValid()) {
@@ -1666,7 +1712,21 @@ public class PostHogReplayIntegration(
                 return false
             }
             maskRect.setScaledScreenshotMask(rect, scaleX, scaleY)
-            canvas.drawRoundRect(maskRect, 10f * scaleX, 10f * scaleY, paint)
+            maskPainter.draw(canvas, maskRect, 10f * scaleX, 10f * scaleY, scaleY)
+        }
+        // Strictly after every mask is down, and strokes only: an outline can never make a
+        // frame less private than the plain masked one.
+        if (outlines.isNotEmpty()) {
+            val started = System.nanoTime()
+            outlinePainter.draw(canvas, rects, outlines, scaleX, scaleY, strokePx = density * scaleX)
+            // walk = the main-thread share (collected during the mask walk); paint runs on the
+            // PixelCopy thread.
+            val walkMs = outlineNanos / 1_000_000.0
+            val paintMs = (System.nanoTime() - started) / 1_000_000.0
+            this@PostHogReplayIntegration.config.logger.log(
+                "Session Replay mask outlines: ${outlines.size} walk=${"%.3f".format(walkMs)}ms " +
+                    "paint=${"%.3f".format(paintMs)}ms.",
+            )
         }
         return true
     }
@@ -1702,7 +1762,14 @@ public class PostHogReplayIntegration(
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             return false
         }
-        return bitmap.paintScreenshotMasks(postWalk.rects, sourceWidth, sourceHeight)
+        return bitmap.paintScreenshotMasks(
+            postWalk.rects,
+            sourceWidth,
+            sourceHeight,
+            outlines = armedCapture.preWalk.outlines,
+            outlineNanos = armedCapture.preWalk.outlineNanos,
+            density = resources.displayMetrics.density,
+        )
     }
 
     private fun View.maskLegacyScreenshot(
@@ -1720,14 +1787,21 @@ public class PostHogReplayIntegration(
             return false
         }
 
-        val walk = MaskWalk(failClosed = false, shouldAbort = unsafeRedraw)
+        val walk = MaskWalk(failClosed = false, shouldAbort = unsafeRedraw, collectOutlines = maskOutlinesEnabled)
         findMaskableWidgets(this, walk)
         if (walk.aborted || unsafeRedraw()) {
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             return false
         }
 
-        return bitmap.paintScreenshotMasks(walk.rects, sourceWidth, sourceHeight) {
+        return bitmap.paintScreenshotMasks(
+            walk.rects,
+            sourceWidth,
+            sourceHeight,
+            outlines = walk.outlines,
+            outlineNanos = walk.outlineNanos,
+            density = resources.displayMetrics.density,
+        ) {
             val safe = !unsafeRedraw()
             if (!safe) {
                 config.logger.log("Session Replay screenshot discarded due to screen changes.")
@@ -2662,6 +2736,7 @@ public class PostHogReplayIntegration(
         // itself then its children, pre-order; updates are appended after adds.
         fun preorder(node: RRWireframe): List<RRWireframe> {
             val out = mutableListOf<RRWireframe>()
+
             fun visit(n: RRWireframe) {
                 out.add(n)
                 n.childWireframes?.forEach(::visit)
@@ -2669,11 +2744,13 @@ public class PostHogReplayIntegration(
             visit(node)
             return out
         }
+
         fun isImage(w: RRWireframe) = w.type == "image" || w.type == "screenshot"
 
         val projected = addedItems.flatMap(::preorder) + updatedItems.flatMap(::preorder)
-        val offender = projected.take(3).firstOrNull(::isImage)
-            ?: return Triple(addedItems, removedItems, updatedItems)
+        val offender =
+            projected.take(3).firstOrNull(::isImage)
+                ?: return Triple(addedItems, removedItems, updatedItems)
 
         val parentOf = newItems.associate { it.id to it.parentId }
         val newMap = newItems.associateBy { it.id }
@@ -3265,6 +3342,7 @@ public class PostHogReplayIntegration(
 
     internal companion object {
         const val PH_NO_CAPTURE_LABEL: String = "ph-no-capture"
+
         const val PH_NO_MASK_LABEL: String = "ph-no-mask"
         const val ANDROID_COMPOSE_VIEW_CLASS_NAME: String = "androidx.compose.ui.platform.AndroidComposeView"
         const val ANDROID_COMPOSE_VIEW: String = "AndroidComposeView"

@@ -33,6 +33,7 @@ import com.posthog.android.internal.MainHandler
 import com.posthog.android.internal.webpBase64
 import com.posthog.android.replay.internal.NextDrawListener
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
+import com.posthog.android.replay.internal.ScreenshotMaskPainter
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.internal.EndpointSpec
@@ -54,8 +55,6 @@ import com.posthog.internal.replay.RRIncrementalMouseInteractionData
 import com.posthog.internal.replay.RRIncrementalMouseInteractionEvent
 import com.posthog.internal.replay.RRMetaEvent
 import com.posthog.internal.replay.RRMouseInteraction
-import com.posthog.internal.replay.RRMutatedNode
-import com.posthog.internal.replay.RRRemovedNode
 import com.posthog.internal.replay.RRWireframe
 import curtains.Curtains
 import curtains.DispatchState
@@ -2695,7 +2694,14 @@ internal class PostHogReplayIntegrationTest {
                     val y = (mask.centerY() * scaleY).toInt()
                     val maskedPixel = bitmap.getPixel((mask.centerX() * scaleX).toInt(), y)
                     // Lossy WebP can slightly perturb a solid black mask.
-                    assertTrue(Color.red(maskedPixel) < 10 && Color.green(maskedPixel) < 10 && Color.blue(maskedPixel) < 10)
+                    // The frame is read back after lossy WebP, so compare with a tolerance.
+                    assertTrue(
+                        listOf(ScreenshotMaskPainter.ORANGE, ScreenshotMaskPainter.BLUE, ScreenshotMaskPainter.YELLOW).any { c ->
+                            Math.abs(Color.red(c) - Color.red(maskedPixel)) + Math.abs(Color.green(c) - Color.green(maskedPixel)) +
+                                Math.abs(Color.blue(c) - Color.blue(maskedPixel)) < 90
+                        } && Color.green(maskedPixel) > 60,
+                        "expected a mask-pattern pixel, got #${Integer.toHexString(maskedPixel)}",
+                    )
                     assertTrue(Color.red(bitmap.getPixel(((mask.left - 20) * scaleX).toInt(), y)) > 200)
                     assertTrue(Color.red(bitmap.getPixel(((mask.right + 20) * scaleX).toInt(), y)) > 200)
                 } finally {
@@ -4241,8 +4247,14 @@ internal class PostHogReplayIntegrationTest {
         type: String? = null,
         children: List<RRWireframe>? = null,
     ) = RRWireframe(
-        id = id, x = 0, y = 0, width = 32, height = 32,
-        parentId = parentId, type = type, childWireframes = children,
+        id = id,
+        x = 0,
+        y = 0,
+        width = 32,
+        height = 32,
+        parentId = parentId,
+        type = type,
+        childWireframes = children,
     )
 
     @Test
@@ -4259,7 +4271,11 @@ internal class PostHogReplayIntegrationTest {
         val (added, removed, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
 
         val flat = mutableListOf<RRWireframe>()
-        fun walk(w: RRWireframe) { flat.add(w); w.childWireframes?.forEach(::walk) }
+
+        fun walk(w: RRWireframe) {
+            flat.add(w)
+            w.childWireframes?.forEach(::walk)
+        }
         added.forEach(::walk)
         assertTrue(
             flat.take(3).none { it.type == "image" },
@@ -4281,7 +4297,6 @@ internal class PostHogReplayIntegrationTest {
         assertTrue(removed.isEmpty(), "padding must not invent removes")
     }
 
-
     // ---- GAME-1277: a subtree must be inserted once per node -------------------
     //
     // findAddedAndRemovedItems is fed the FLATTENED trees, so every descendant is
@@ -4300,13 +4315,19 @@ internal class PostHogReplayIntegrationTest {
         width: Int = 10,
         children: List<RRWireframe>? = null,
     ) = RRWireframe(
-        id = id, x = 0, y = 0, width = width, height = 10,
-        parentId = parentId, childWireframes = children,
+        id = id,
+        x = 0,
+        y = 0,
+        width = width,
+        height = 10,
+        parentId = parentId,
+        childWireframes = children,
     )
 
     /** Every id reachable from these wireframes, counted with multiplicity. */
     private fun reachableIds(items: List<RRWireframe>): List<Int> {
         val out = mutableListOf<Int>()
+
         fun walk(n: RRWireframe) {
             out.add(n.id)
             n.childWireframes?.forEach { walk(it) }
@@ -4365,13 +4386,19 @@ internal class PostHogReplayIntegrationTest {
         // enumerate them in tree order.
         val ids = listOf(100, 7, 4096, 33, 2)
         var parent: Int? = 1
-        val chain = ids.map { id -> val w = wf(id, parentId = parent); parent = id; w }
+        val chain =
+            ids.map { id ->
+                val w = wf(id, parentId = parent)
+                parent = id
+                w
+            }
         val oldChain = chain.map { it.copy(width = 10) }
         val newChain = chain.map { it.copy(width = 99) }
-        val (_, _, updated) = sut.findAddedAndRemovedItems(
-            listOf(wf(1)) + oldChain,
-            listOf(wf(1)) + newChain,
-        )
+        val (_, _, updated) =
+            sut.findAddedAndRemovedItems(
+                listOf(wf(1)) + oldChain,
+                listOf(wf(1)) + newChain,
+            )
 
         // Only the outermost changed node ships; it carries the rest.
         assertEquals(listOf(100), updated.map { it.id }, "nested updates must collapse to the root")
@@ -4410,9 +4437,13 @@ internal class PostHogReplayIntegrationTest {
     fun `the whole retained subtree is re-added, not just its root`() {
         val sut = getSut()
         // 100 removed; 101 and its own child 102 both survive beneath it.
-        val oldItems = listOf(
-            wf(1), wf(100, parentId = 1), wf(101, parentId = 100), wf(102, parentId = 101),
-        )
+        val oldItems =
+            listOf(
+                wf(1),
+                wf(100, parentId = 1),
+                wf(101, parentId = 100),
+                wf(102, parentId = 101),
+            )
         val newItems = listOf(wf(1), wf(101, parentId = 1), wf(102, parentId = 101))
 
         val (added, _, _) = sut.findAddedAndRemovedItems(oldItems, newItems)
