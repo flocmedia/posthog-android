@@ -17,6 +17,7 @@ import com.posthog.android.PostHogAndroidConfig
 import com.posthog.android.internal.MainHandler
 import com.posthog.android.replay.internal.MaskOutlinePainter
 import com.posthog.android.replay.internal.MaskOutlines
+import com.posthog.android.replay.internal.OutlineCollector
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.Shadows.shadowOf
@@ -34,25 +35,28 @@ import kotlin.test.assertTrue
  * recordOutlineIfInFront + MaskOutlinePainter).
  *
  * MUTATION EVIDENCE — each edit applied to production code, named test watched go red:
- *  M1  recordOutlineIfInFront: drop the `rectsBefore == 0` guard
+ *  M1  OutlineCollector.consider: drop the `rectsBefore == 0` guard
  *      => SURVIVES, and is an equivalent mutation: with no mask down yet, intersectsAny runs
  *         against an empty list and is false, so the guard is only a fast exit. The behaviour it
  *         looks like it protects is viewsBehindTheMaskAreNotOutlined, which intersectsAny holds.
- *  M2  recordOutlineIfInFront: drop `rects.size != rectsBefore` (outline a view that masked itself)
+ *  M2  OutlineCollector.consider: drop `rects.size != rectsBefore` (outline a view that masked itself)
  *      => aMaskedViewInFrontOfAnotherMaskIsNotOutlined FAILS.
  *  M3  MaskOutlines.drawsItself: return true for every view
  *      => onlyViewsInFrontThatDrawAndOverlapAreOutlined FAILS (the bare layout is outlined).
- *  M4  MaskOutlines.quadInRoot: skip `matrix.mapPoints(out)`
+ *  M4  OutlineCollector.ensureMatrices: skip `m.preConcat(own)`
  *      => aRotatedViewYieldsItsRotatedQuad FAILS (axis-aligned corners).
- *  M5  MaskOutlines.quadInRoot: stop climbing at the first parent
+ *  M5  OutlineCollector.ensureMatrices: `m.reset()` instead of `m.set(matrices[i - 1])`
  *      => nestedOffsetsAccumulateToRootCoordinates FAILS.
  *  M6  MaskOutlinePainter.draw: remove `canvas.clipPath(clip)`
  *      => strokesStayInsideTheMask FAILS (the stroke lands outside the mask).
- *  M7  recordOutlineIfInFront: drop the MAX_OUTLINES check
+ *  M7  OutlineCollector.consider: drop the MAX_OUTLINES check
  *      => outlinesAreCappedButMaskingIsNot FAILS.
- *  M8  runArmMaskCaptureLoop / legacy walk: pass collectOutlines = false
- *      => covered on-device by the capture harness, not here: those walks need a live
- *         PixelCopy. The compare-mode guard is compareModeWalkCollectsNothing.
+ *  M8  OutlineCollector.consider: never set cullDepth
+ *      => aClippingGroupOffTheMaskIsNotSearched FAILS.
+ *  M9  OutlineCollector.consider: drop `&& rects.size == cullRectCount`
+ *      => aMaskFoundInsideACulledGroupLiftsTheCull FAILS.
+ *  Not covered here: runArmMaskCaptureLoop / the legacy walk passing collectOutlines = true.
+ *  Those walks need a live PixelCopy; the capture harness covers them on-device.
  */
 @RunWith(AndroidJUnit4::class)
 @Config(sdk = [26], qualifiers = "w400dp-h800dp-mdpi")
@@ -213,6 +217,45 @@ internal class PostHogReplayMaskOutlinesTest {
             Rect(65 + ox, 85 + oy, 85 + ox, 105 + oy),
             walk(root).outlines.single().bounds(),
         )
+    }
+
+    @Test
+    fun aClippingGroupOffTheMaskIsNotSearched() {
+        // Culling is a speed-up, not a behaviour: a child outside its clipping parent is already
+        // dropped by the walk's visibility check. So observe the work itself -- which views the
+        // collector examined.
+        val group =
+            FrameLayout(activity).also {
+                it.background = ColorDrawable(Color.WHITE)
+                bounds[it] = Bounds(0, 500, 400, 700)
+            }
+        val leaves = List(5) { leaf(10 * it, 10, 10 * it + 5, 15) }
+        leaves.forEach { group.addView(it) }
+        val root = mount(photo(0, 0, 400, 400), group)
+
+        val examined = mutableListOf<View>()
+        val walk = PostHogReplayIntegration.MaskWalk(collectOutlines = true)
+        walk.outlineCollector =
+            OutlineCollector(isStable = {
+                examined.add(it)
+                true
+            }, isOpaque = { false })
+        with(sut) { findMaskableWidgets(root, walk) }
+
+        assertTrue(group in examined, "the group itself is examined")
+        assertTrue(leaves.none { it in examined }, "nothing under it is")
+    }
+
+    @Test
+    fun aMaskFoundInsideACulledGroupLiftsTheCull() {
+        // The group misses the first mask (so it is culled), but holds a second mask and a view
+        // drawn over that one.
+        val group = FrameLayout(activity).also { bounds[it] = Bounds(0, 500, 400, 700) }
+        group.addView(photo(0, 0, 200, 200))
+        group.addView(leaf(50, 50, 100, 100))
+        val root = mount(photo(0, 0, 400, 400), group)
+
+        assertEquals(1, walk(root).outlines.size)
     }
 
     @Test

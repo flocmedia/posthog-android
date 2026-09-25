@@ -72,8 +72,8 @@ import com.posthog.android.replay.internal.BaselineResult
 import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.MaskOutlinePainter
-import com.posthog.android.replay.internal.MaskOutlines
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.OutlineCollector
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ScreenshotMaskPainter
@@ -1102,8 +1102,13 @@ public class PostHogReplayIntegration(
         val collectOutlines: Boolean = false,
     ) {
         val rects: MutableList<Rect> = mutableListOf()
-        val outlines: MutableList<FloatArray> = mutableListOf()
-        var outlineNanos: Long = 0L
+
+        // Created by the first findMaskableWidgets call on a collecting walk.
+        var outlineCollector: OutlineCollector? = null
+        val outlines: List<FloatArray>
+            get() = outlineCollector?.outlines ?: emptyList()
+        val outlineNanos: Long
+            get() = outlineCollector?.nanos ?: 0L
         var poisoned: Boolean = false
         var aborted: Boolean = false
             private set
@@ -1159,6 +1164,27 @@ public class PostHogReplayIntegration(
 
     // internal (not private) so tests and benchmarks can drive walks directly.
     internal fun findMaskableWidgets(
+        view: View,
+        walk: MaskWalk,
+    ) {
+        if (!walk.collectOutlines) {
+            findMaskableWidgetsInner(view, walk)
+            return
+        }
+        val collector =
+            walk.outlineCollector ?: OutlineCollector(
+                isStable = { it.isViewStateStableForMatrixOperations() },
+                isOpaque = { it.isComposeView() },
+            ).also { walk.outlineCollector = it }
+        collector.enter(view)
+        try {
+            findMaskableWidgetsInner(view, walk)
+        } finally {
+            collector.exit()
+        }
+    }
+
+    private fun findMaskableWidgetsInner(
         view: View,
         walk: MaskWalk,
     ) {
@@ -1224,9 +1250,9 @@ public class PostHogReplayIntegration(
             }
         }
 
-        if (walk.collectOutlines) {
-            walk.recordOutlineIfInFront(view, rectsBefore)
-        }
+        // The walk is pre-order in draw order, so once a mask exists every view reached after it
+        // is drawn on top of it.
+        walk.outlineCollector?.consider(view, rectsBefore, walk.rects)
 
         if (walkChildren && view is ViewGroup && view.childCount > 0) {
             for (i in 0 until view.childCount) {
@@ -1248,30 +1274,6 @@ public class PostHogReplayIntegration(
                 findMaskableWidgets(viewChild, walk)
             }
         }
-    }
-
-    // The walk is pre-order in draw order, so once a mask rect exists every view reached after
-    // it is drawn on top of it. A view that masked itself is left alone; Compose is opaque here.
-    private fun MaskWalk.recordOutlineIfInFront(
-        view: View,
-        rectsBefore: Int,
-    ) {
-        if (rectsBefore == 0 || rects.size != rectsBefore || outlines.size >= MaskOutlines.MAX_OUTLINES) {
-            return
-        }
-        if (view.width <= 0 || view.height <= 0 || view.isComposeView() || !MaskOutlines.drawsItself(view)) {
-            return
-        }
-        if (!view.isViewStateStableForMatrixOperations()) {
-            return
-        }
-        val started = System.nanoTime()
-        val quad = FloatArray(8)
-        MaskOutlines.quadInRoot(view, quad)
-        if (MaskOutlines.intersectsAny(quad, rects)) {
-            outlines.add(quad)
-        }
-        outlineNanos += System.nanoTime() - started
     }
 
     private fun View.addGlobalVisibleRect(walk: MaskWalk) {

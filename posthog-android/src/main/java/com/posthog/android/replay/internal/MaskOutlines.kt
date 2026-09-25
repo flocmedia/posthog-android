@@ -1,6 +1,7 @@
 package com.posthog.android.replay.internal
 
 import android.graphics.Canvas
+import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
@@ -19,43 +20,6 @@ import android.view.ViewGroup
 internal object MaskOutlines {
     // A screen with more in-front views than this still gets masked; the rest go unoutlined.
     const val MAX_OUTLINES = 256
-
-    /**
-     * Maps [view]'s four local corners into its root's coordinate space (the space
-     * getGlobalVisibleRect reports mask rects in), applying every transform on the way up, so a
-     * rotated or scaled view yields its true quad rather than a loose bounding box.
-     * [out] receives x0,y0 .. x3,y3 (top-left, top-right, bottom-right, bottom-left).
-     */
-    fun quadInRoot(
-        view: View,
-        out: FloatArray,
-    ) {
-        val w = view.width.toFloat()
-        val h = view.height.toFloat()
-        out[0] = 0f
-        out[1] = 0f
-        out[2] = w
-        out[3] = 0f
-        out[4] = w
-        out[5] = h
-        out[6] = 0f
-        out[7] = h
-        var current: View = view
-        while (true) {
-            val matrix = current.matrix
-            if (!matrix.isIdentity) {
-                matrix.mapPoints(out)
-            }
-            val parent = current.parent as? View
-            val dx = current.left - (parent?.scrollX ?: 0)
-            val dy = current.top - (parent?.scrollY ?: 0)
-            for (i in 0 until 8 step 2) {
-                out[i] += dx
-                out[i + 1] += dy
-            }
-            current = parent ?: break
-        }
-    }
 
     /** Whether [view] paints anything of its own: a leaf, or a container with a background. */
     fun drawsItself(view: View): Boolean = view !is ViewGroup || view.background != null
@@ -80,6 +44,151 @@ internal object MaskOutlines {
             }
         }
         return false
+    }
+}
+
+/**
+ * Collects outline quads during ONE mask walk. The walk tells it when it enters and leaves each
+ * view, so it keeps the current root-to-view path and caches each depth's accumulated transform:
+ * a view's quad costs one concat + map instead of a climb to the root (two native Matrix calls
+ * per ancestor), which dominated on a drawer full of grid cells.
+ *
+ * It also culls: a clipping ViewGroup that misses every mask cannot have a descendant drawn over
+ * one, so nothing under it is examined (the walk still descends it looking for masks). A mask
+ * found later invalidates the cull, since it could lie inside that subtree.
+ */
+internal class OutlineCollector(
+    private val isStable: (View) -> Boolean,
+    private val isOpaque: (View) -> Boolean,
+) {
+    val outlines: MutableList<FloatArray> = mutableListOf()
+    var nanos: Long = 0L
+        private set
+
+    private val path = ArrayList<View>()
+    private val matrices = ArrayList<Matrix>()
+    private var validDepth = -1
+    private var cullDepth = -1
+    private var cullRectCount = 0
+    private val scratch = FloatArray(8)
+    private val chain = ArrayList<View>()
+
+    fun enter(view: View) {
+        path.add(view)
+        val depth = path.size - 1
+        if (validDepth >= depth) validDepth = depth - 1
+        // A view at or above the culled group's depth means the walk has left that subtree.
+        if (cullDepth >= depth) cullDepth = -1
+    }
+
+    fun exit() {
+        path.removeAt(path.size - 1)
+        if (validDepth >= path.size) validDepth = path.size - 1
+    }
+
+    /**
+     * Called for the view at the top of the path once the walk has classified it.
+     * [rectsBefore] is the mask count when the walk reached it: zero means nothing is behind it
+     * yet, and a grown count means the view masked itself.
+     */
+    fun consider(
+        view: View,
+        rectsBefore: Int,
+        rects: List<Rect>,
+    ) {
+        if (rectsBefore == 0 || rects.size != rectsBefore || outlines.size >= MaskOutlines.MAX_OUTLINES) {
+            return
+        }
+        val depth = path.size - 1
+        if (cullDepth in 0 until depth && rects.size == cullRectCount) {
+            return
+        }
+        val started = System.nanoTime()
+        try {
+            if (view.width <= 0 || view.height <= 0 || isOpaque(view)) {
+                return
+            }
+            val clips = view is ViewGroup && view.clipChildren
+            val draws = MaskOutlines.drawsItself(view)
+            if (!draws && !clips) {
+                return
+            }
+            if (!isStable(view)) {
+                return
+            }
+            quad(depth, scratch)
+            if (MaskOutlines.intersectsAny(scratch, rects)) {
+                if (draws) outlines.add(scratch.copyOf())
+            } else if (clips) {
+                cullDepth = depth
+                cullRectCount = rects.size
+            }
+        } finally {
+            nanos += System.nanoTime() - started
+        }
+    }
+
+    // The view's four corners (TL, TR, BR, BL) in the root's space, the space
+    // getGlobalVisibleRect reports mask rects in.
+    private fun quad(
+        depth: Int,
+        out: FloatArray,
+    ) {
+        ensureMatrices(depth)
+        val view = path[depth]
+        val w = view.width.toFloat()
+        val h = view.height.toFloat()
+        out[0] = 0f
+        out[1] = 0f
+        out[2] = w
+        out[3] = 0f
+        out[4] = w
+        out[5] = h
+        out[6] = 0f
+        out[7] = h
+        matrices[depth].mapPoints(out)
+    }
+
+    // matrices[i] maps path[i]'s local space to the root: parent's matrix, then this view's
+    // offset in the parent (minus the parent's scroll), then its own transform.
+    private fun ensureMatrices(depth: Int) {
+        for (i in validDepth + 1..depth) {
+            while (matrices.size <= i) matrices.add(Matrix())
+            val m = matrices[i]
+            val view = path[i]
+            if (i == 0) {
+                rootMatrix(view, m)
+            } else {
+                m.set(matrices[i - 1])
+                val parent = path[i - 1]
+                m.preTranslate((view.left - parent.scrollX).toFloat(), (view.top - parent.scrollY).toFloat())
+                val own = view.matrix
+                if (!own.isIdentity) m.preConcat(own)
+            }
+        }
+        validDepth = depth
+    }
+
+    // The walk may start below the window root; climb once so path[0] is in root space too.
+    private fun rootMatrix(
+        view: View,
+        m: Matrix,
+    ) {
+        chain.clear()
+        var current: View? = view
+        while (current != null) {
+            chain.add(current)
+            current = current.parent as? View
+        }
+        m.reset()
+        for (j in chain.indices.reversed()) {
+            val v = chain[j]
+            val parent = chain.getOrNull(j + 1)
+            m.preTranslate((v.left - (parent?.scrollX ?: 0)).toFloat(), (v.top - (parent?.scrollY ?: 0)).toFloat())
+            val own = v.matrix
+            if (!own.isIdentity) m.preConcat(own)
+        }
+        chain.clear()
     }
 }
 
