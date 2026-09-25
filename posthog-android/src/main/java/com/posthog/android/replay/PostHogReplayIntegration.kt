@@ -73,6 +73,7 @@ import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.MaskOutlinePainter
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
+import com.posthog.android.replay.internal.OutlineBudget
 import com.posthog.android.replay.internal.OutlineCollector
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ReplayImageBudget
@@ -206,6 +207,12 @@ public class PostHogReplayIntegration(
     // builds flip it to compare against a plain masked frame.
     @PostHogVisibleForTesting
     internal var maskOutlinesEnabled: Boolean = true
+
+    // Backs outlines off, then off for good, on a device where collecting them is slow.
+    @PostHogVisibleForTesting
+    internal var outlineBudget: OutlineBudget = OutlineBudget(log = { config.logger.log(it) })
+
+    private fun shouldCollectOutlines(): Boolean = maskOutlinesEnabled && outlineBudget.shouldCollect()
 
     @Volatile
     private var isSessionReplayActive: Boolean = false
@@ -1575,15 +1582,20 @@ public class PostHogReplayIntegration(
         drawState: WindowDrawState,
     ): ArmedMaskCapture? {
         var armed: ArmedMaskCapture? = null
+        // Decided once per capture, not per attempt, so retries don't burn backoff slots; every
+        // attempt's collection time counts against the budget.
+        val collectOutlines = shouldCollectOutlines()
+        var outlineNanos = 0L
         for (attempt in 0 until MAX_BASELINE_ARM_ATTEMPTS) {
             val token = drawState.beginMaskCapture()
-            val preWalk = MaskWalk(collectOutlines = maskOutlinesEnabled)
+            val preWalk = MaskWalk(collectOutlines = collectOutlines)
             try {
                 findMaskableWidgets(view, preWalk)
             } catch (e: Throwable) {
                 config.logger.log("Session Replay mask walk failed: $e.")
                 preWalk.poisoned = true
             }
+            outlineNanos += preWalk.outlineNanos
             if (preWalk.poisoned) {
                 drawState.cancelMaskCapture(token)
                 break
@@ -1599,6 +1611,9 @@ public class PostHogReplayIntegration(
                     break
                 }
             }
+        }
+        if (collectOutlines) {
+            outlineBudget.record(outlineNanos)
         }
         return armed
     }
@@ -1787,8 +1802,12 @@ public class PostHogReplayIntegration(
             return false
         }
 
-        val walk = MaskWalk(failClosed = false, shouldAbort = unsafeRedraw, collectOutlines = maskOutlinesEnabled)
+        val collectOutlines = shouldCollectOutlines()
+        val walk = MaskWalk(failClosed = false, shouldAbort = unsafeRedraw, collectOutlines = collectOutlines)
         findMaskableWidgets(this, walk)
+        if (collectOutlines) {
+            outlineBudget.record(walk.outlineNanos)
+        }
         if (walk.aborted || unsafeRedraw()) {
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             return false
