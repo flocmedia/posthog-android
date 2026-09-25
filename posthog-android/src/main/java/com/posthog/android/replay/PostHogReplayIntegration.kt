@@ -73,7 +73,6 @@ import com.posthog.android.replay.internal.IntHashSet
 import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
-import com.posthog.android.replay.internal.IncrementalMutationDedup
 import com.posthog.android.replay.internal.ReplayImageBudget
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
@@ -920,15 +919,13 @@ public class PostHogReplayIntegration(
                     listOf(wireframe).flattenChildren(),
                 )
 
-            // GAME-1315 — the diff runs on a FLATTENED tree but each entry is emitted with
-            // its whole subtree, so a node is serialized once for itself and once inside every
-            // changed ancestor (~13x on a scrolling image grid). That inflates the request batch
-            // until ingest drops it, taking the establishing full snapshot with it. Keep only the
-            // top-most entries; the player flattens and dedupes by id anyway, so the ancestor's
-            // copy IS the same node. See IncrementalMutationDedup for why entries are dropped
-            // whole rather than having their children stripped.
+            // De-duplication, ordering and subtree shape are all decided inside
+            // findAddedAndRemovedItems / buildUpdates above: adds arrive child-stripped and
+            // parent-first, updates arrive outermost-only with their subtrees intact, and
+            // adds covered by a shipped update have already been dropped. Nothing further
+            // may be filtered or reordered here -- doing so is what broke this before.
             val addedNodes = mutableListOf<RRMutatedNode>()
-            IncrementalMutationDedup.dropCovered(addedItems).forEach {
+            addedItems.forEach {
                 val item = RRMutatedNode(it, parentId = it.parentId)
                 addedNodes.add(item)
             }
@@ -940,7 +937,7 @@ public class PostHogReplayIntegration(
             }
 
             val updatedNodes = mutableListOf<RRMutatedNode>()
-            IncrementalMutationDedup.dropCovered(updatedItems).forEach {
+            updatedItems.forEach {
                 val item = RRMutatedNode(it, parentId = it.parentId)
                 updatedNodes.add(item)
             }
@@ -2490,31 +2487,149 @@ public class PostHogReplayIntegration(
 
         // Find added items by subtracting oldItemIds from newItemIds
         val addedIds = newItemIds - oldItemIds
-        val addedItems = newItems.filter { it.id in addedIds }
 
         // Find removed items by subtracting newItemIds from oldItemIds
         val removedIds = oldItemIds - newItemIds
         val removedItems = oldItems.filter { it.id in removedIds }
 
-        val updatedItems = mutableListOf<RRWireframe>()
+        // GAME-1277 / GAME-1315: this diff is a flat id-SET difference, but rrweb applies
+        // mutations with SUBTREE semantics -- removing a node destroys everything beneath
+        // it. A node whose ancestor is removed while the node itself survives in the new
+        // tree is in BOTH id sets, so it is classified as neither added nor removed and no
+        // add is ever emitted for it: the player destroys it with its old parent while the
+        // SDK still believes it is live. Every later mutation touching it is then silently
+        // dropped, and since a session emits exactly ONE full snapshot there is no
+        // recovery -- the document bleeds nodes until it renders white. Measured on a real
+        // drive: 164 nodes destroyed in the player that the SDK never removed, 225
+        // subsequent adds orphaned.
+        //
+        // The same hole swallows a plain MOVE (re-parent), which an id-set diff likewise
+        // cannot express.
+        //
+        // So: re-emit as an add any surviving node whose parent changed, whose old parent
+        // is being removed, or whose parent is itself being re-emitted (the cascade --
+        // childWireframes are stripped below, so re-adding a subtree root does NOT bring
+        // its descendants back; each one must be listed). `newItems` is flattened
+        // pre-order, so a single forward pass sees every parent before its children and
+        // the emitted adds stay parent-first.
+        val oldParentOf = oldItems.associate { it.id to it.parentId }
+        val reAddedIds = HashSet<Int>()
+        for (item in newItems) {
+            if (item.id in addedIds) continue
+            val oldParent = oldParentOf[item.id]
+            if (oldParent != item.parentId ||
+                (oldParent != null && oldParent in removedIds) ||
+                (item.parentId != null && item.parentId in reAddedIds)
+            ) {
+                reAddedIds.add(item.id)
+            }
+        }
+
+        // Strip childWireframes before emitting. `newItems` is ALREADY flattened
+        // (flattenChildren, pre-order), so every descendant is present as its own entry
+        // carrying its own parentId -- keeping the nested children here makes rrweb
+        // materialize each descendant TWICE: once from inside its ancestor's payload, then
+        // again from its own entry. Re-inserting an id already in the mirror corrupts it.
+        val addedItems =
+            newItems
+                .filter { it.id in addedIds || it.id in reAddedIds }
+                .map { it.copy(childWireframes = null) }
 
         // Find updated items by finding the intersection of oldItemIds and newItemIds
         val sameItems = oldItemIds.intersect(newItemIds)
 
-        for (id in sameItems) {
+        // GAME-1277: iterate newItems, NOT sameItems. `sameItems` is a HashSet
+        // intersection, so it enumerates in hash order -- and update order is
+        // load-bearing, because the player does not apply an update as an attribute
+        // change: it rewrites every update into remove(P) + add(P)
+        // (common/replay-shared/src/mobile/transformer/transformers.ts,
+        // makeIncrementalEvent). rrweb applies ALL removes before ANY add, so an update
+        // list that happens to hash a child ahead of its parent re-adds the child into a
+        // parent that does not exist yet, and the child is dropped for good. Measured on a
+        // real S24 drag: one mutation put child 109494020 at add position 10 and its
+        // parent 181802666 at 28. newItems is flattened pre-order, so this is parent-first
+        // by construction.
+        val changedIds = LinkedHashSet<Int>()
+        for (item in newItems) {
+            val id = item.id
+            if (id !in sameItems) continue
+
+            // A node we are re-adding must not ALSO be updated: the update's synthesized
+            // remove would undo the re-add. The add carries the new values already, so the
+            // update is redundant as well as harmful.
+            if (id in reAddedIds) continue
+
             // we have to copy without the childWireframes, otherwise they all would be different
             // if one of the child is different, but we only wanna compare the parent
             val oldItem = oldMap[id]?.copy(childWireframes = null) ?: continue
-            val newItem = newMap[id] ?: continue
-            val newItemCopy = newItem.copy(childWireframes = null)
+            val newItemCopy = item.copy(childWireframes = null)
 
-            // If the items are different (any property has a different value), add the new item to the updatedItems list
             if (oldItem != newItemCopy) {
-                updatedItems.add(newItem)
+                changedIds.add(id)
             }
         }
 
-        return avoidScreenshotMisdetection(addedItems, removedItems, updatedItems, newItems, oldItemIds)
+        val (adds, removes, updates) = buildUpdates(addedItems, removedItems, changedIds, newItems, newMap)
+        return avoidScreenshotMisdetection(adds, removes, updates, newItems, oldItemIds)
+    }
+
+    /**
+     * GAME-1277: an update must carry its subtree, and only the outermost one.
+     *
+     * The player turns every update into remove(P) + add(P), and its add is built with
+     * `cloneWithoutChildren`. A remove takes the whole subtree with it, so an update of P
+     * that ships P alone DESTROYS everything under P and brings P back empty -- which is
+     * why stripping childWireframes (correct for the adds path, where the flattened
+     * enumeration already contributes every descendant) is exactly wrong for updates.
+     * Upstream says as much: "each update wireframe carries the entire tree because we
+     * don't want to diff on the client".
+     *
+     * So each update ships `newMap[id]`, subtree intact, and anything already covered by
+     * an enclosing update -- a nested update, or an add landing inside it -- is dropped,
+     * since the enclosing subtree reinstates it in one ordered piece. That also removes
+     * the add/update collision: an add under an updated node used to be emitted before the
+     * update's synthesized remove wiped it.
+     */
+    private fun buildUpdates(
+        addedItems: List<RRWireframe>,
+        removedItems: List<RRWireframe>,
+        changedIds: LinkedHashSet<Int>,
+        newItems: List<RRWireframe>,
+        newMap: Map<Int, RRWireframe>,
+    ): Triple<List<RRWireframe>, List<RRWireframe>, List<RRWireframe>> {
+        if (changedIds.isEmpty()) {
+            return Triple(addedItems, removedItems, emptyList())
+        }
+
+        val parentOf = newItems.associate { it.id to it.parentId }
+
+        // Keep only the outermost changed node on each path to the root.
+        fun hasChangedAncestor(id: Int): Boolean {
+            var ancestor = parentOf[id]
+            val guard = HashSet<Int>()
+            while (ancestor != null && guard.add(ancestor)) {
+                if (ancestor in changedIds) return true
+                ancestor = parentOf[ancestor]
+            }
+            return false
+        }
+
+        val roots = changedIds.filterNot { hasChangedAncestor(it) }
+
+        // Everything inside a shipped update travels with it.
+        val childrenOf = newItems.groupBy { it.parentId }
+        val covered = HashSet<Int>()
+        for (root in roots) {
+            val stack = ArrayDeque(childrenOf[root].orEmpty())
+            while (stack.isNotEmpty()) {
+                val node = stack.removeLast()
+                if (!covered.add(node.id)) continue
+                stack.addAll(childrenOf[node.id].orEmpty())
+            }
+        }
+
+        val updatedItems = roots.mapNotNull { newMap[it] }
+        return Triple(addedItems.filter { it.id !in covered }, removedItems, updatedItems)
     }
 
     /**
