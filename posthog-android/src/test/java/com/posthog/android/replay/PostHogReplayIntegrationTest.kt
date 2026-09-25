@@ -31,6 +31,7 @@ import com.posthog.android.PostHogAndroidConfig
 import com.posthog.android.createPostHogFake
 import com.posthog.android.internal.MainHandler
 import com.posthog.android.internal.webpBase64
+import com.posthog.android.replay.internal.ScreenshotMaskPainter
 import com.posthog.android.replay.internal.NextDrawListener
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
@@ -2695,7 +2696,14 @@ internal class PostHogReplayIntegrationTest {
                     val y = (mask.centerY() * scaleY).toInt()
                     val maskedPixel = bitmap.getPixel((mask.centerX() * scaleX).toInt(), y)
                     // Lossy WebP can slightly perturb a solid black mask.
-                    assertTrue(Color.red(maskedPixel) < 10 && Color.green(maskedPixel) < 10 && Color.blue(maskedPixel) < 10)
+                    // The frame is read back after lossy WebP, so compare with a tolerance.
+                    assertTrue(
+                        listOf(ScreenshotMaskPainter.ORANGE, ScreenshotMaskPainter.BLUE, ScreenshotMaskPainter.YELLOW).any { c ->
+                            Math.abs(Color.red(c) - Color.red(maskedPixel)) + Math.abs(Color.green(c) - Color.green(maskedPixel)) +
+                                Math.abs(Color.blue(c) - Color.blue(maskedPixel)) < 90
+                        } && Color.green(maskedPixel) > 60,
+                        "expected a mask-pattern pixel, got #${Integer.toHexString(maskedPixel)}",
+                    )
                     assertTrue(Color.red(bitmap.getPixel(((mask.left - 20) * scaleX).toInt(), y)) > 200)
                     assertTrue(Color.red(bitmap.getPixel(((mask.right + 20) * scaleX).toInt(), y)) > 200)
                 } finally {

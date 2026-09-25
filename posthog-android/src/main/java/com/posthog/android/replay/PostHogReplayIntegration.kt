@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Point
 import android.graphics.PorterDuff
 import android.graphics.Rect
@@ -74,6 +75,7 @@ import com.posthog.android.replay.internal.MaskCaptureToken
 import com.posthog.android.replay.internal.NextDrawListener.Companion.onNextDraw
 import com.posthog.android.replay.internal.PixelCopyBitmapBuffer
 import com.posthog.android.replay.internal.ReplayImageBudget
+import com.posthog.android.replay.internal.ScreenshotMaskPainter
 import com.posthog.android.replay.internal.ViewTreeSnapshotStatus
 import com.posthog.android.replay.internal.WindowDrawState
 import com.posthog.android.replay.internal.isAlive
@@ -196,10 +198,7 @@ public class PostHogReplayIntegration(
         displayMetrics.density
     }
 
-    private val paint =
-        Paint().apply {
-            color = Color.BLACK
-        }
+    private val maskPainter = ScreenshotMaskPainter()
 
     @Volatile
     private var isSessionReplayActive: Boolean = false
@@ -1666,7 +1665,7 @@ public class PostHogReplayIntegration(
                 return false
             }
             maskRect.setScaledScreenshotMask(rect, scaleX, scaleY)
-            canvas.drawRoundRect(maskRect, 10f * scaleX, 10f * scaleY, paint)
+            maskPainter.draw(canvas, maskRect, 10f * scaleX, 10f * scaleY, scaleY)
         }
         return true
     }
@@ -3265,6 +3264,7 @@ public class PostHogReplayIntegration(
 
     internal companion object {
         const val PH_NO_CAPTURE_LABEL: String = "ph-no-capture"
+
         const val PH_NO_MASK_LABEL: String = "ph-no-mask"
         const val ANDROID_COMPOSE_VIEW_CLASS_NAME: String = "androidx.compose.ui.platform.AndroidComposeView"
         const val ANDROID_COMPOSE_VIEW: String = "AndroidComposeView"
