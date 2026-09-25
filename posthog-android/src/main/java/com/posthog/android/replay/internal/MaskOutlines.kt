@@ -1,11 +1,13 @@
 package com.posthog.android.replay.internal
 
 import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.ColorDrawable
 import android.view.View
 import android.view.ViewGroup
 
@@ -22,7 +24,19 @@ internal object MaskOutlines {
     const val MAX_OUTLINES = 256
 
     /** Whether [view] paints anything of its own: a leaf, or a container with a background. */
-    fun drawsItself(view: View): Boolean = view !is ViewGroup || view.background != null
+    fun drawsItself(view: View): Boolean = view !is ViewGroup || hasVisibleBackground(view)
+
+    /**
+     * A container that paints its own background over the mask is a PANEL (a drawer, a sheet, a
+     * card): one outline of the panel says what is there, so its subtree is not outlined. That
+     * turns the sticker drawer's ~90 grid cells into one box, which is most of the cost.
+     */
+    fun isPanel(view: View): Boolean = view is ViewGroup && hasVisibleBackground(view)
+
+    private fun hasVisibleBackground(view: View): Boolean {
+        val background = view.background ?: return false
+        return background !is ColorDrawable || Color.alpha(background.color) != 0
+    }
 
     fun intersectsAny(
         quad: FloatArray,
@@ -119,6 +133,10 @@ internal class OutlineCollector(
             quad(depth, scratch)
             if (MaskOutlines.intersectsAny(scratch, rects)) {
                 if (draws) outlines.add(scratch.copyOf())
+                if (clips && MaskOutlines.isPanel(view)) {
+                    cullDepth = depth
+                    cullRectCount = rects.size
+                }
             } else if (clips) {
                 cullDepth = depth
                 cullRectCount = rects.size

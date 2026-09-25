@@ -55,6 +55,10 @@ import kotlin.test.assertTrue
  *      => aClippingGroupOffTheMaskIsNotSearched FAILS.
  *  M9  OutlineCollector.consider: drop `&& rects.size == cullRectCount`
  *      => aMaskFoundInsideACulledGroupLiftsTheCull FAILS.
+ *  M10 OutlineCollector.consider: never collapse a panel (drop the isPanel cull)
+ *      => aPanelOverTheMaskIsOneOutlineNotOnePerChild FAILS (7 outlines).
+ *  M11 MaskOutlines.hasVisibleBackground: ignore the ColorDrawable alpha test
+ *      => aTransparentBackgroundIsNotAPanel FAILS.
  *  Not covered here: runArmMaskCaptureLoop / the legacy walk passing collectOutlines = true.
  *  Those walks need a live PixelCopy; the capture harness covers them on-device.
  */
@@ -187,6 +191,38 @@ internal class PostHogReplayMaskOutlinesTest {
 
         val (ox, oy) = rootOffset(root).let { it[0] to it[1] }
         assertEquals(listOf(Rect(ox, 300 + oy, 400 + ox, 800 + oy)), walk(root).outlines.map { it.bounds() })
+    }
+
+    @Test
+    fun aPanelOverTheMaskIsOneOutlineNotOnePerChild() {
+        val drawer =
+            FrameLayout(activity).also {
+                it.background = ColorDrawable(Color.WHITE)
+                bounds[it] = Bounds(0, 200, 400, 800)
+            }
+        repeat(6) { drawer.addView(leaf(20 * it, 10, 20 * it + 15, 25)) }
+        val root = mount(photo(0, 0, 400, 400), drawer)
+
+        val (ox, oy) = rootOffset(root).let { it[0] to it[1] }
+        assertEquals(listOf(Rect(ox, 200 + oy, 400 + ox, 800 + oy)), walk(root).outlines.map { it.bounds() })
+    }
+
+    @Test
+    fun aTransparentBackgroundIsNotAPanel() {
+        val layer =
+            FrameLayout(activity).also {
+                it.background = ColorDrawable(Color.TRANSPARENT)
+                bounds[it] = Bounds(0, 0, 400, 400)
+            }
+        layer.addView(leaf(100, 100, 150, 150))
+        val root = mount(photo(0, 0, 400, 400), layer)
+
+        val (ox, oy) = rootOffset(root).let { it[0] to it[1] }
+        assertEquals(
+            listOf(Rect(100 + ox, 100 + oy, 150 + ox, 150 + oy)),
+            walk(root).outlines.map { it.bounds() },
+            "the layer draws nothing, so it is neither outlined nor collapses its child",
+        )
     }
 
     @Test
