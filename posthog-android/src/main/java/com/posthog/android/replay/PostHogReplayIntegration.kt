@@ -1717,9 +1717,13 @@ public class PostHogReplayIntegration(
         if (outlines.isNotEmpty()) {
             val started = System.nanoTime()
             outlinePainter.draw(canvas, rects, outlines, scaleX, scaleY, strokePx = density * scaleX)
-            val totalMs = (outlineNanos + System.nanoTime() - started) / 1_000_000.0
+            // walk = the main-thread share (collected during the mask walk); paint runs on the
+            // PixelCopy thread.
+            val walkMs = outlineNanos / 1_000_000.0
+            val paintMs = (System.nanoTime() - started) / 1_000_000.0
             this@PostHogReplayIntegration.config.logger.log(
-                "Session Replay mask outlines: ${outlines.size} took ${"%.3f".format(totalMs)} ms.",
+                "Session Replay mask outlines: ${outlines.size} walk=${"%.3f".format(walkMs)}ms " +
+                    "paint=${"%.3f".format(paintMs)}ms.",
             )
         }
         return true
