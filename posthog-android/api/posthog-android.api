@@ -79,6 +79,13 @@ public final class com/posthog/android/replay/PostHogMaskModifier {
 	public static synthetic fun postHogUnmask$default (Lcom/posthog/android/replay/PostHogMaskModifier;Landroidx/compose/ui/Modifier;ZILjava/lang/Object;)Landroidx/compose/ui/Modifier;
 }
 
+public final class com/posthog/android/replay/PostHogRedrawOverMask {
+	public static final field INSTANCE Lcom/posthog/android/replay/PostHogRedrawOverMask;
+	public static final fun isMarked (Landroid/view/View;)Z
+	public static final fun mark (Landroid/view/View;)V
+	public static final fun unmark (Landroid/view/View;)V
+}
+
 public final class com/posthog/android/replay/PostHogReplayIntegration : com/posthog/PostHogIntegration, com/posthog/internal/replay/PostHogSessionReplayHandler {
 	public static final field ANDROID_COMPOSE_VIEW Ljava/lang/String;
 	public static final field ANDROID_COMPOSE_VIEW_CLASS_NAME Ljava/lang/String;
