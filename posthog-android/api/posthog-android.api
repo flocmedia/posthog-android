@@ -121,6 +121,7 @@ public final class com/posthog/android/replay/PostHogSessionReplayConfig {
 	public final fun getDrawableConverter ()Lcom/posthog/android/replay/PostHogDrawableConverter;
 	public final fun getMaskAllImages ()Z
 	public final fun getMaskAllTextInputs ()Z
+	public final fun getOnMaskOutlinesDisabled ()Lkotlin/jvm/functions/Function2;
 	public final fun getSampleRate ()Ljava/lang/Double;
 	public final fun getScreenshot ()Z
 	public final fun getScreenshotColorMode ()Lcom/posthog/android/replay/PostHogScreenshotColorMode;
@@ -134,6 +135,7 @@ public final class com/posthog/android/replay/PostHogSessionReplayConfig {
 	public final fun setDrawableConverter (Lcom/posthog/android/replay/PostHogDrawableConverter;)V
 	public final fun setMaskAllImages (Z)V
 	public final fun setMaskAllTextInputs (Z)V
+	public final fun setOnMaskOutlinesDisabled (Lkotlin/jvm/functions/Function2;)V
 	public final fun setSampleRate (Ljava/lang/Double;)V
 	public final fun setScreenshot (Z)V
 	public final fun setScreenshotColorMode (Lcom/posthog/android/replay/PostHogScreenshotColorMode;)V
