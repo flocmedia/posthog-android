@@ -57,7 +57,8 @@ internal class PostHogAndroidConfigTest {
     }
 
     @Test
-    fun `screenshot mask alignment verification should be disabled by default`() {
-        assertFalse(config.sessionReplayConfig.verifyScreenshotMaskAlignment)
+    fun `screenshot mask alignment verification is always on in this fork`() {
+        // GAME-1402: the unverified screenshot path is gone; the flag only reports that.
+        assertTrue(config.sessionReplayConfig.verifyScreenshotMaskAlignment)
     }
 }

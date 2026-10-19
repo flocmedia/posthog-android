@@ -28,8 +28,6 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.PixelCopy
-import android.view.SurfaceView
-import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewTreeObserver
@@ -289,59 +287,18 @@ public class PostHogReplayIntegration(
         // Keep this first so a draw that overlaps the verified pre-walk cannot go unnoticed.
         drawState.recordDraw()
 
-        val classifyLegacyDraw =
-            !shouldVerifyMaskAlignment(view, drawState) ||
-                drawState.isLegacyCaptureActive
-        if (classifyLegacyDraw) {
-            val screenshotCapable = config.sessionReplayConfig.screenshot || !isNativeSdk
-            val isOnlyAnimationRedraw =
-                screenshotCapable &&
-                    !drawState.didLayoutSinceReset &&
-                    (view.hasTransientState() || view.hasActiveSurfaceRendering()) &&
-                    !view.isAnimationRunning()
-            drawState.recordLegacyAnimationRedraw(isOnlyAnimationRedraw)
-        }
-
         val session = drawState.beginDrawSample() ?: return
         val walk = drawSampleWalk
         walk.resetForCompareAgainst(session.compareBaseline)
         var misaligned: Boolean
         try {
-            findMaskableWidgets(view, walk)
+            findWindowMasks(view, walk)
             misaligned = walk.poisoned || walk.isMisaligned()
         } catch (e: Throwable) {
             config.logger.log("Session Replay draw-time mask walk failed: $e.")
             misaligned = true
         }
         drawState.recordMaskWalk(session.token, misaligned)
-    }
-
-    /**
-     * Looks for a visible surface-backed view whose pixels can change without moving its masks.
-     * This keeps the legacy screenshot redraw guard compatible when direct mask verification is off.
-     */
-    private fun View.hasActiveSurfaceRendering(): Boolean {
-        return try {
-            when {
-                visibility != View.VISIBLE ||
-                    alpha <= 0f ||
-                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && transitionAlpha <= 0f) -> false
-                this is TextureView -> isAvailable && width > 0 && height > 0
-                this is SurfaceView -> width > 0 && height > 0
-                this is ViewGroup -> {
-                    for (i in 0 until childCount) {
-                        if (getChildAt(i).hasActiveSurfaceRendering()) {
-                            return true
-                        }
-                    }
-                    false
-                }
-                else -> false
-            }
-        } catch (e: Throwable) {
-            config.logger.log("Session Replay surface rendering check failed: $e.")
-            false
-        }
     }
 
     private fun addView(
@@ -1287,10 +1244,39 @@ public class PostHogReplayIntegration(
         }
     }
 
+    /**
+     * The mask walk over a whole window. GAME-1402: a window that is not showing (its activity
+     * stopping, say) is poisoned rather than walked, because every view in it reads as not
+     * visible -- no masks at all -- while its last frame can still be copied with the photo on it.
+     */
+    internal fun findWindowMasks(
+        root: View,
+        walk: MaskWalk,
+    ) {
+        if (!root.isWindowShowing()) {
+            walk.poisoned = true
+            return
+        }
+        findMaskableWidgets(root, walk)
+    }
+
+    private fun View.isWindowShowing(): Boolean {
+        return try {
+            isAttachedToWindow && windowVisibility == View.VISIBLE
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay window visibility check failed: $e.")
+            false
+        }
+    }
+
     private fun View.addGlobalVisibleRect(walk: MaskWalk) {
         if (isViewStateStableForMatrixOperations()) {
             getGlobalVisibleRect(walk.scratchRect, walk.scratchPoint)
             walk.addRect(walk.scratchRect)
+        } else if (walk.failClosed && isRenderedButUnplaceable()) {
+            // GAME-1402: a view that must be masked but whose geometry is unknowable right now
+            // poisons the walk instead of silently going unmasked.
+            walk.poisoned = true
         }
     }
 
@@ -1301,6 +1287,9 @@ public class PostHogReplayIntegration(
      */
     private fun TextView.addTextAreaGlobalVisibleRect(walk: MaskWalk) {
         if (!isViewStateStableForMatrixOperations()) {
+            if (walk.failClosed && isRenderedButUnplaceable()) {
+                walk.poisoned = true
+            }
             return
         }
         getGlobalVisibleRect(walk.scratchRect, walk.scratchPoint)
@@ -1466,74 +1455,6 @@ public class PostHogReplayIntegration(
         return isComposeAvailable && this.javaClass.name.contains(ANDROID_COMPOSE_VIEW)
     }
 
-    // Compose recomposes on almost every frame, and the legacy redraw classifier can never treat a
-    // Compose redraw as animation-only, so the legacy path discards every frame and the recording
-    // stays blank. Route Compose-rooted windows onto the verified path, which compares real mask
-    // geometry, so pixel-only redraws survive.
-    private fun shouldVerifyMaskAlignment(
-        view: View,
-        drawState: WindowDrawState,
-    ): Boolean {
-        return config.sessionReplayConfig.verifyScreenshotMaskAlignment ||
-            view.isComposeRooted(drawState)
-    }
-
-    private fun View.isComposeRooted(drawState: WindowDrawState): Boolean {
-        drawState.composeRooted?.let { return it }
-        if (!isComposeAvailable) {
-            // Can never become true, so skip the main-thread hop entirely.
-            drawState.composeRooted = false
-            return false
-        }
-
-        if (!drawState.shouldRecheckComposeRoot(config.dateProvider.nanoTime())) {
-            return false
-        }
-
-        // The View hierarchy is main-thread-owned, so detection must run there: inline when
-        // already on it, otherwise post and wait, exactly like findMaskableComposeWidgets.
-        val rooted = runOnMainThreadBlocking { containsComposeView() }
-
-        // A swallowed failure cached as false would silently restore the every-frame-discard
-        // bug, so only a definite verdict is cached; "unknown" retries on the next draw.
-        if (rooted == null) {
-            drawState.clearComposeRootCheck()
-            return false
-        }
-        drawState.composeRooted = rooted
-        return rooted
-    }
-
-    // Scratch for the Compose-root walk; like the mask walks, it only runs on the main thread.
-    private val composeRootVisitedViews = IntHashSet()
-
-    private fun View.containsComposeView(): Boolean? {
-        return try {
-            composeRootVisitedViews.clear()
-            containsComposeView(composeRootVisitedViews)
-        } catch (e: Throwable) {
-            config.logger.log("Session Replay Compose view detection failed: $e.")
-            null
-        }
-    }
-
-    private fun View.containsComposeView(visitedViews: IntHashSet): Boolean {
-        if (!visitedViews.add(System.identityHashCode(this))) {
-            return false
-        }
-        if (isComposeView()) {
-            return true
-        }
-        if (this is ViewGroup) {
-            for (i in 0 until childCount) {
-                if (getChildAt(i)?.containsComposeView(visitedViews) == true) {
-                    return true
-                }
-            }
-        }
-        return false
-    }
-
     // Warns once after a run of discards so a silently blank recording stops being invisible.
     private fun recordScreenshotDiscarded(drawState: WindowDrawState) {
         if (drawState.recordScreenshotDiscard()) {
@@ -1594,7 +1515,7 @@ public class PostHogReplayIntegration(
             val token = drawState.beginMaskCapture()
             val preWalk = MaskWalk(collectOutlines = collectOutlines)
             try {
-                findMaskableWidgets(view, preWalk)
+                findWindowMasks(view, preWalk)
             } catch (e: Throwable) {
                 config.logger.log("Session Replay mask walk failed: $e.")
                 preWalk.poisoned = true
@@ -1765,7 +1686,7 @@ public class PostHogReplayIntegration(
         // so the post-copy walk would be wasted work.
         val alreadyDoomed = drawState.isCaptureInvalid(armedCapture.token)
         if (!alreadyDoomed) {
-            findMaskableWidgets(this, postWalk)
+            findWindowMasks(this, postWalk)
         }
 
         val captureAligned =
@@ -1789,48 +1710,6 @@ public class PostHogReplayIntegration(
             outlineNanos = armedCapture.preWalk.outlineNanos,
             density = resources.displayMetrics.density,
         )
-    }
-
-    private fun View.maskLegacyScreenshot(
-        bitmap: Bitmap,
-        drawState: WindowDrawState,
-        sourceWidth: Int,
-        sourceHeight: Int,
-    ): Boolean {
-        val unsafeRedraw = {
-            width != sourceWidth || height != sourceHeight ||
-                (drawState.isOnDrawnCalled && !drawState.isOnlyAnimationRedraw)
-        }
-        if (unsafeRedraw()) {
-            config.logger.log("Session Replay screenshot discarded due to screen changes.")
-            return false
-        }
-
-        val collectOutlines = shouldCollectOutlines()
-        val walk = MaskWalk(failClosed = false, shouldAbort = unsafeRedraw, collectOutlines = collectOutlines)
-        findMaskableWidgets(this, walk)
-        if (collectOutlines) {
-            outlineBudget.record(walk.outlineNanos)
-        }
-        if (walk.aborted || unsafeRedraw()) {
-            config.logger.log("Session Replay screenshot discarded due to screen changes.")
-            return false
-        }
-
-        return bitmap.paintScreenshotMasks(
-            walk.rects,
-            sourceWidth,
-            sourceHeight,
-            outlines = walk.outlines,
-            outlineNanos = walk.outlineNanos,
-            density = resources.displayMetrics.density,
-        ) {
-            val safe = !unsafeRedraw()
-            if (!safe) {
-                config.logger.log("Session Replay screenshot discarded due to screen changes.")
-            }
-            safe
-        }
     }
 
     private class PixelCopyRequestState {
@@ -1863,15 +1742,10 @@ public class PostHogReplayIntegration(
 
     private fun finishScreenshotCapture(
         drawState: WindowDrawState,
-        armedCapture: ArmedMaskCapture?,
-        verifyMaskAlignment: Boolean,
+        armedCapture: ArmedMaskCapture,
     ) {
-        armedCapture?.let { drawState.cancelMaskCapture(it.token) }
-        if (verifyMaskAlignment) {
-            drawState.reset()
-        } else {
-            drawState.finishLegacyCapture()
-        }
+        drawState.cancelMaskCapture(armedCapture.token)
+        drawState.reset()
     }
 
     private fun scaledScreenshotDimension(
@@ -1915,25 +1789,27 @@ public class PostHogReplayIntegration(
             }
         var base64: String? = null
 
-        val verifyMaskAlignment = shouldVerifyMaskAlignment(view, drawState)
-        val armedCapture =
-            if (verifyMaskAlignment) {
-                drawState.reset()
-                // The pre-walk samples the baseline before the pixels freeze. Once armed, draws are
-                // verified against it, so pixel-only redraws survive while geometry changes discard.
-                armMaskCapture(view, drawState)
-            } else {
-                drawState.beginLegacyCapture()
-                null
-            }
-        if (verifyMaskAlignment && armedCapture == null) {
+        // GAME-1402: every screenshot takes the verified path; there is no unverified fallback.
+        // The old unverified ("legacy") path copied the screen first and walked the LIVE view
+        // tree afterwards, on the PixelCopy thread. That tree can be ahead of the copied pixels: a
+        // tagged view hidden (or set to alpha 0) since the last draw, or moved by a layout whose
+        // draw an OnPreDrawListener cancelled, was masked where it now is, or not at all, while
+        // the copy still showed it where it was. Reproduced on device: the photo went out
+        // unmasked. The verified path walks on the main thread before the copy (so the tree it
+        // reads is the one the copied frame was drawn from), re-walks on every draw while the
+        // capture is open, and discards the frame on any layout or mask change.
+        drawState.reset()
+        // The pre-walk samples the baseline before the pixels freeze. Once armed, draws are
+        // verified against it, so pixel-only redraws survive while geometry changes discard.
+        val armedCapture = armMaskCapture(view, drawState)
+        if (armedCapture == null) {
             config.logger.log("Session Replay screenshot discarded due to screen changes.")
             recordScreenshotDiscarded(drawState)
             return null
         }
 
         if (sourceWidth <= 0 || sourceHeight <= 0 || view.width != sourceWidth || view.height != sourceHeight) {
-            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+            finishScreenshotCapture(drawState, armedCapture)
             recordScreenshotDiscarded(drawState)
             return null
         }
@@ -1947,12 +1823,12 @@ public class PostHogReplayIntegration(
                     scaledScreenshotDimension(sourceHeight, screenshotScale),
                     bitmapConfig,
                 ) ?: run {
-                    finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+                    finishScreenshotCapture(drawState, armedCapture)
                     recordScreenshotDiscarded(drawState)
                     return null
                 }
         } catch (e: Throwable) {
-            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+            finishScreenshotCapture(drawState, armedCapture)
             config.logger.log("Session Replay screenshot setup failed: $e.")
             recordScreenshotDiscarded(drawState)
             return null
@@ -1983,11 +1859,7 @@ public class PostHogReplayIntegration(
                             config.logger.log("Session Replay PixelCopy failed: $copyResult.")
                         } else if (!requestState.isAbandoned()) {
                             succeeded =
-                                if (armedCapture != null) {
-                                    view.maskVerifiedScreenshot(bitmap, drawState, armedCapture, sourceWidth, sourceHeight)
-                                } else {
-                                    view.maskLegacyScreenshot(bitmap, drawState, sourceWidth, sourceHeight)
-                                }
+                                view.maskVerifiedScreenshot(bitmap, drawState, armedCapture, sourceWidth, sourceHeight)
                         }
                     } catch (e: Throwable) {
                         config.logger.log("Session Replay PixelCopy failed: $e.")
@@ -2051,7 +1923,7 @@ public class PostHogReplayIntegration(
                 null -> Unit
             }
         } finally {
-            finishScreenshotCapture(drawState, armedCapture, verifyMaskAlignment)
+            finishScreenshotCapture(drawState, armedCapture)
             if (releaseFromWaiter) {
                 bitmapLease.release()
             }
