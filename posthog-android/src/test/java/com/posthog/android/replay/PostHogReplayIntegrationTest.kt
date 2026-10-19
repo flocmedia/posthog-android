@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Point
 import android.graphics.Rect
@@ -233,7 +234,7 @@ internal class PostHogReplayIntegrationTest {
     }
 
     private fun getSut(config: PostHogAndroidConfig = PostHogAndroidConfig(API_KEY)): PostHogReplayIntegration {
-        return PostHogReplayIntegration(context, config, MainHandler())
+        return PostHogReplayIntegration(context, config, MainHandler()).robolectricDrawn()
     }
 
     private fun countingReplayExecutor(counter: AtomicInteger): ExecutorService {
@@ -255,7 +256,7 @@ internal class PostHogReplayIntegrationTest {
         config: PostHogAndroidConfig,
         executor: ExecutorService,
     ): PostHogReplayIntegration {
-        return PostHogReplayIntegration(context, config, MainHandler(), executor)
+        return PostHogReplayIntegration(context, config, MainHandler(), executor).robolectricDrawn()
     }
 
     // Robolectric resets WindowManagerGlobal between tests, but Curtains caches its old
@@ -491,7 +492,7 @@ internal class PostHogReplayIntegrationTest {
     fun `captureTouches enabled by default records touch start and end coordinates`() {
         val config = configWithSampling(flagActive = true, samplingPasses = true)
         val executor = QueuedReplayExecutor(createReplayExecutor())
-        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor).robolectricDrawn()
         val fake = createPostHogFake()
         sut.install(fake)
         try {
@@ -523,7 +524,7 @@ internal class PostHogReplayIntegrationTest {
         config.sessionReplayConfig.captureTouches = false
         val executor = QueuedReplayExecutor(createReplayExecutor())
         val dateCalls = AtomicInteger(0)
-        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor).robolectricDrawn()
         val fake = createPostHogFake()
         sut.install(fake)
         try {
@@ -1071,7 +1072,7 @@ internal class PostHogReplayIntegrationTest {
         awaitReplayExecutors()
         assertEquals(1, replayQueue.bufferDepth)
 
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         sut.install(mock<PostHogInterface>())
         awaitReplayExecutors()
 
@@ -1091,7 +1092,7 @@ internal class PostHogReplayIntegrationTest {
                 this.logger = logger
                 remoteConfigHolder = remoteConfig
             }
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         sut.onRemoteConfig()
         val replayQueue = createReplayQueue(config)
         config.replayQueueHolder = replayQueue
@@ -1125,7 +1126,7 @@ internal class PostHogReplayIntegrationTest {
         val secondSessionId = UUID.randomUUID()
         val postHog = mock<PostHogInterface>()
         whenever(postHog.getSessionId()).thenReturn(firstSessionId)
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         val replayQueue = createReplayQueue(config)
         config.replayQueueHolder = replayQueue
         PostHogSessionManager.setSessionId(firstSessionId)
@@ -1195,7 +1196,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, executor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(integrationContext, config, MainHandler())
+        val sut = PostHogReplayIntegration(integrationContext, config, MainHandler()).robolectricDrawn()
         return RealQueueFixture(sut, replayQueue, innerQueue, config, remoteConfig)
     }
 
@@ -1785,7 +1786,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, executor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         val postHog = mock<PostHogInterface>()
         whenever(postHog.getSessionId()).thenReturn(UUID.randomUUID())
         sut.install(postHog)
@@ -1921,7 +1922,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, queueExecutor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
 
         // Wire the real remote config with the production dispatch: loaded = hasRemoteConfigFetched().
         val remoteConfigExecutor = createReplayExecutor()
@@ -3893,6 +3894,65 @@ internal class PostHogReplayIntegrationTest {
             val drawnAt = captureRedFrameThen(h) {}
             assertEquals(1, h.fake.captures)
             assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view moved by a layout whose draw was cancelled before the capture never ships unmasked`() {
+        // The editor's OnPreDrawListeners (ChromeBottomStack, ChromeRowD2, LabelFit) return
+        // false after re-fitting something: layout has moved the photo, the screen still shows
+        // it where it was, and the next capture starts from that tree.
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            h.status.drawState.recordDraw() // the frame on screen: child at (40,40)-(140,140)
+            val drawnAt =
+                captureRedFrameThen(h) {}.also {
+                    assertEquals(1, h.fake.captures) // control: unchanged tree, frame kept
+                }
+            h.child.layout(40, 160, 140, 260)
+            h.status.drawState.recordLayout() // OnGlobalLayout ran; the draw was cancelled
+            val capturesBefore = h.fake.captures
+            RecordingShadowPixelCopy.onRequest = { it.eraseColor(Color.RED) }
+            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
+            assertEquals(capturesBefore, h.fake.captures)
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+
+            h.status.drawState.recordDraw() // the moved tree reaches the screen
+            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
+            assertEquals(capturesBefore + 1, h.fake.captures)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    fun `a capture is skipped while the view tree has changes no draw has rendered`() {
+        val h = screenshotCaptureHarness()
+        h.fx.sut.undrawnChangesOverride = null // the real check
+        try {
+            RecordingShadowPixelCopy.reset()
+
+            fun drawTree() = h.hookLayout.draw(Canvas(Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)))
+
+            drawTree()
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(1, RecordingShadowPixelCopy.requests.size)
+
+            // Hidden since the last draw: the screen still shows it, the tree says it is gone.
+            h.child.visibility = View.INVISIBLE
+            assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(1, RecordingShadowPixelCopy.requests.size) // never copied
+
+            drawTree()
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
         } finally {
             h.fx.sut.uninstall()
             RecordingShadowPixelCopy.reset()

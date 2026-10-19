@@ -68,6 +68,12 @@ internal class WindowDrawState {
     var isLegacyCaptureActive: Boolean = false
         private set
 
+    // GAME-1402: a layout ran and no draw has followed it yet -- an OnPreDrawListener cancelled
+    // that draw. The view tree then holds geometry the screen does not show. Unlike
+    // didLayoutSinceReset, a capture reset does not clear it; only a draw does.
+    @Volatile
+    var layoutSinceDraw: Boolean = false
+
     // Whether this window's view tree is rooted in Jetpack Compose. Detected once from the tree,
     // then cached, so the redraw handling does not re-walk the tree on every draw.
     @Volatile
@@ -180,6 +186,7 @@ internal class WindowDrawState {
     // beginDrawSample alone would be racy: a during-pre-walk draw could lose the lock race to
     // setBaseline and be misclassified as post-baseline.
     fun recordDraw() {
+        layoutSinceDraw = false
         isOnDrawnCalled = true
         drawCount++
         isOnlyAnimationRedraw = false
@@ -260,6 +267,7 @@ internal class WindowDrawState {
     }
 
     fun recordLayout() {
+        layoutSinceDraw = true
         didLayoutSinceReset = true
         // Compose can be mounted lazily, so a "not Compose" verdict must be re-checked after a
         // layout. A "Compose" verdict never needs re-checking: the window simply stays on the

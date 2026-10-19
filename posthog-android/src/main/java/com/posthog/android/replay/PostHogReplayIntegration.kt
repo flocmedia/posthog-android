@@ -1260,6 +1260,23 @@ public class PostHogReplayIntegration(
         findMaskableWidgets(root, walk)
     }
 
+    // Robolectric never draws, so every view there stays dirty forever; unit tests that are not
+    // about this check replace it. Production never sets it.
+    internal var undrawnChangesOverride: ((View, WindowDrawState) -> Boolean)? = null
+
+    // Main thread only. True when this window's tree has changes no draw has rendered yet.
+    // Between frames an idle or animator-driven tree is clean (animators invalidate inside the
+    // frame that draws them), so this only trips when a change raced the capture.
+    private fun View.hasUndrawnChanges(drawState: WindowDrawState): Boolean {
+        undrawnChangesOverride?.let { return it(this, drawState) }
+        return try {
+            drawState.layoutSinceDraw || isLayoutRequested || isDirty
+        } catch (e: Throwable) {
+            config.logger.log("Session Replay undrawn-change check failed: $e.")
+            true
+        }
+    }
+
     private fun View.isWindowShowing(): Boolean {
         return try {
             isAttachedToWindow && windowVisibility == View.VISIBLE
@@ -1512,6 +1529,13 @@ public class PostHogReplayIntegration(
         val collectOutlines = shouldCollectOutlines()
         var outlineNanos = 0L
         for (attempt in 0 until MAX_BASELINE_ARM_ATTEMPTS) {
+            if (view.hasUndrawnChanges(drawState)) {
+                // GAME-1402: the pre-walk must read the tree the copied frame was drawn from. A
+                // pending layout or invalidation, or a layout whose draw an OnPreDrawListener
+                // cancelled, means the tree is ahead of the screen: the masks would land where
+                // views are going to be, not where the copy shows them. Skip this frame.
+                break
+            }
             val token = drawState.beginMaskCapture()
             val preWalk = MaskWalk(collectOutlines = collectOutlines)
             try {
