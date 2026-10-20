@@ -72,7 +72,7 @@ internal class PostHogReplayMaskOutlinesTest {
     @BeforeTest
     fun setUp() {
         val config = PostHogAndroidConfig(API_KEY).apply { sessionReplayConfig.screenshot = true }
-        sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler())
+        sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler()).robolectricDrawn()
         activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         shadowOf(android.os.Looper.getMainLooper()).idle()
         val attachInfo =

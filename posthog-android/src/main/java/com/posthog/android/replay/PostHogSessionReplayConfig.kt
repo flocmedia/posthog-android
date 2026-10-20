@@ -71,14 +71,13 @@ public class PostHogSessionReplayConfig
         public var captureTouches: Boolean = true
 
         /**
-         * Verifies mask alignment for session replay screenshots.
-         * This can preserve screenshots during pixel-only redraws, including continuously animated
-         * content, but performs additional view hierarchy walks while a screenshot is captured.
-         * Defaults to false. Windows with a Compose root always use the verified path regardless
-         * of this flag, so setting it to false does not disable verification for them.
+         * No effect in this fork: screenshots ALWAYS verify mask alignment (GAME-1402).
+         * The unverified path painted masks from the live view tree after the copy, so a masked
+         * view hidden, faded out or moved since the last draw went out unmasked. Kept only so
+         * existing callers compile.
          */
         @PostHogExperimental
-        public var verifyScreenshotMaskAlignment: Boolean = false
+        public var verifyScreenshotMaskAlignment: Boolean = true
 
         /**
          * WebP compression quality for screenshots, clamped to 0..100. Defaults to 30.

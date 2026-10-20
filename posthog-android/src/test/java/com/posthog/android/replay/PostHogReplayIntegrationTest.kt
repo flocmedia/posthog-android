@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Point
 import android.graphics.Rect
@@ -233,7 +234,7 @@ internal class PostHogReplayIntegrationTest {
     }
 
     private fun getSut(config: PostHogAndroidConfig = PostHogAndroidConfig(API_KEY)): PostHogReplayIntegration {
-        return PostHogReplayIntegration(context, config, MainHandler())
+        return PostHogReplayIntegration(context, config, MainHandler()).robolectricDrawn()
     }
 
     private fun countingReplayExecutor(counter: AtomicInteger): ExecutorService {
@@ -255,7 +256,7 @@ internal class PostHogReplayIntegrationTest {
         config: PostHogAndroidConfig,
         executor: ExecutorService,
     ): PostHogReplayIntegration {
-        return PostHogReplayIntegration(context, config, MainHandler(), executor)
+        return PostHogReplayIntegration(context, config, MainHandler(), executor).robolectricDrawn()
     }
 
     // Robolectric resets WindowManagerGlobal between tests, but Curtains caches its old
@@ -491,7 +492,7 @@ internal class PostHogReplayIntegrationTest {
     fun `captureTouches enabled by default records touch start and end coordinates`() {
         val config = configWithSampling(flagActive = true, samplingPasses = true)
         val executor = QueuedReplayExecutor(createReplayExecutor())
-        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor).robolectricDrawn()
         val fake = createPostHogFake()
         sut.install(fake)
         try {
@@ -523,7 +524,7 @@ internal class PostHogReplayIntegrationTest {
         config.sessionReplayConfig.captureTouches = false
         val executor = QueuedReplayExecutor(createReplayExecutor())
         val dateCalls = AtomicInteger(0)
-        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor)
+        val sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler(), executor).robolectricDrawn()
         val fake = createPostHogFake()
         sut.install(fake)
         try {
@@ -1071,7 +1072,7 @@ internal class PostHogReplayIntegrationTest {
         awaitReplayExecutors()
         assertEquals(1, replayQueue.bufferDepth)
 
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         sut.install(mock<PostHogInterface>())
         awaitReplayExecutors()
 
@@ -1091,7 +1092,7 @@ internal class PostHogReplayIntegrationTest {
                 this.logger = logger
                 remoteConfigHolder = remoteConfig
             }
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         sut.onRemoteConfig()
         val replayQueue = createReplayQueue(config)
         config.replayQueueHolder = replayQueue
@@ -1125,7 +1126,7 @@ internal class PostHogReplayIntegrationTest {
         val secondSessionId = UUID.randomUUID()
         val postHog = mock<PostHogInterface>()
         whenever(postHog.getSessionId()).thenReturn(firstSessionId)
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         val replayQueue = createReplayQueue(config)
         config.replayQueueHolder = replayQueue
         PostHogSessionManager.setSessionId(firstSessionId)
@@ -1195,7 +1196,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, executor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(integrationContext, config, MainHandler())
+        val sut = PostHogReplayIntegration(integrationContext, config, MainHandler()).robolectricDrawn()
         return RealQueueFixture(sut, replayQueue, innerQueue, config, remoteConfig)
     }
 
@@ -1785,7 +1786,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, executor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
         val postHog = mock<PostHogInterface>()
         whenever(postHog.getSessionId()).thenReturn(UUID.randomUUID())
         sut.install(postHog)
@@ -1921,7 +1922,7 @@ internal class PostHogReplayIntegrationTest {
             )
         val replayQueue = PostHogReplayQueue(config, innerQueue, storagePrefix, queueExecutor)
         config.replayQueueHolder = replayQueue
-        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler())
+        val sut = PostHogReplayIntegration(mock<Context>(), config, MainHandler()).robolectricDrawn()
 
         // Wire the real remote config with the production dispatch: loaded = hasRemoteConfigFetched().
         val remoteConfigExecutor = createReplayExecutor()
@@ -2929,252 +2930,6 @@ internal class PostHogReplayIntegrationTest {
     }
 
     @Test
-    fun `disabled verification does not run a draw-time mask walk during capture`() {
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-        shadowOf(Looper.getMainLooper()).idle()
-        var visibleRectCalls = 0
-        val child = VisibleRectHookView(activity) { _, _ -> visibleRectCalls++ }
-        val root = FrameLayout(activity).apply { addView(child) }
-        activity.setContentView(root)
-        shadowOf(Looper.getMainLooper()).idle()
-        root.layout(0, 0, 100, 100)
-        child.layout(0, 0, 100, 20)
-        visibleRectCalls = 0
-        val drawState = WindowDrawState()
-        drawState.beginLegacyCapture()
-
-        try {
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertEquals(0, visibleRectCalls)
-        } finally {
-            drawState.finishLegacyCapture()
-            fx.sut.uninstall()
-        }
-    }
-
-    // A class name the production Compose-view heuristic accepts, so a window containing it is
-    // treated as Compose-rooted.
-    private class FakeAndroidComposeView(context: Context) : View(context)
-
-    private class ThrowingChildFrameLayout(context: Context) : FrameLayout(context) {
-        override fun getChildAt(index: Int): View? {
-            throw IllegalStateException("broken hierarchy")
-        }
-    }
-
-    @Test
-    fun `compose rooted window uses the verified path when verification is disabled`() {
-        // A Compose redraw can never be classified as animation-only, so on the legacy path
-        // every frame is discarded. Compose-rooted windows must use the verified path instead,
-        // so the legacy animation-redraw classifier never runs for them.
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root = FrameLayout(activity).apply { addView(FakeAndroidComposeView(activity)) }
-            root.setHasTransientState(true)
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertFalse(drawState.isOnlyAnimationRedraw)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    fun `compose rooted cache invalidates when layout changes`() {
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root =
-                FrameLayout(activity).apply {
-                    addView(View(activity))
-                    setHasTransientState(true)
-                }
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-            fx.sut.onDrawCallback(root, drawState)
-            assertTrue(drawState.isOnlyAnimationRedraw)
-
-            root.addView(FakeAndroidComposeView(activity))
-            drawState.recordLayout()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertFalse(drawState.isOnlyAnimationRedraw)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    fun `compose detection failures fall back to the legacy classifier`() {
-        val messages = Collections.synchronizedList(mutableListOf<String>())
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        fx.config.logger =
-            object : PostHogLogger {
-                override fun log(message: String) {
-                    messages.add(message)
-                }
-
-                override fun isEnabled(): Boolean = true
-            }
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root =
-                ThrowingChildFrameLayout(activity).apply {
-                    addView(View(activity))
-                    setHasTransientState(true)
-                }
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertTrue(drawState.isOnlyAnimationRedraw)
-            assertTrue(messages.any { it.contains("Compose view detection failed") })
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    private class OnceThrowingChildFrameLayout(context: Context) : FrameLayout(context) {
-        private var thrown = false
-
-        override fun getChildAt(index: Int): View? {
-            if (!thrown) {
-                thrown = true
-                throw IllegalStateException("broken hierarchy")
-            }
-            return super.getChildAt(index)
-        }
-    }
-
-    @Test
-    fun `compose detection failure is not cached and re-runs on the next draw`() {
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root =
-                OnceThrowingChildFrameLayout(activity).apply {
-                    addView(FakeAndroidComposeView(activity))
-                    setHasTransientState(true)
-                }
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-            assertTrue(drawState.isOnlyAnimationRedraw)
-
-            drawState.recordDraw()
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertFalse(drawState.isOnlyAnimationRedraw)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    private class CountingChildFrameLayout(context: Context) : FrameLayout(context) {
-        var childWalkCount = 0
-
-        override fun getChildAt(index: Int): View? {
-            childWalkCount++
-            return super.getChildAt(index)
-        }
-    }
-
-    @Test
-    fun `positive compose verdict survives a layout without re-walking the tree`() {
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root =
-                CountingChildFrameLayout(activity).apply {
-                    addView(FakeAndroidComposeView(activity))
-                    setHasTransientState(true)
-                }
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-            assertFalse(drawState.isOnlyAnimationRedraw)
-            val walkCountAfterFirstDraw = root.childWalkCount
-            assertTrue(walkCountAfterFirstDraw > 0)
-
-            drawState.recordLayout()
-            drawState.recordDraw()
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertEquals(walkCountAfterFirstDraw, root.childWalkCount)
-            assertFalse(drawState.isOnlyAnimationRedraw)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    fun `negative compose verdict is not re-walked on the first draw after every layout`() {
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root =
-                CountingChildFrameLayout(activity).apply {
-                    addView(View(activity))
-                    setHasTransientState(true)
-                }
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-            val walkCountAfterFirstDraw = root.childWalkCount
-            assertTrue(walkCountAfterFirstDraw > 0)
-
-            // A layout clears the "not Compose" verdict so lazily mounted Compose is still picked
-            // up, but the re-check is rate-limited, so the next draw must not re-walk the tree.
-            drawState.recordLayout()
-            drawState.recordDraw()
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertEquals(walkCountAfterFirstDraw, root.childWalkCount)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    fun `non compose window keeps the legacy classifier when verification is disabled`() {
-        // Control for the Compose routing test: a plain View window still runs the legacy
-        // animation-redraw classifier.
-        val (fx, _) = screenshotFixture(enableMaskAlignmentVerification = false)
-        try {
-            val activity = Robolectric.buildActivity(Activity::class.java).setup().get()
-            shadowOf(Looper.getMainLooper()).idle()
-            val root = FrameLayout(activity).apply { addView(View(activity)) }
-            root.setHasTransientState(true)
-            val drawState = WindowDrawState()
-            drawState.recordDraw()
-
-            fx.sut.onDrawCallback(root, drawState)
-
-            assertTrue(drawState.isOnlyAnimationRedraw)
-        } finally {
-            fx.sut.uninstall()
-        }
-    }
-
-    @Test
     fun `warns after consecutive screenshot discards`() {
         // A blank recording is silent: each discard logs a debug line, but nothing tells the
         // customer the recording is empty. A run of discards must raise one warning.
@@ -3770,84 +3525,6 @@ internal class PostHogReplayIntegrationTest {
 
     @Test
     @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
-    fun `stable redraw is discarded by default when mask alignment verification is disabled`() {
-        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
-        try {
-            DrawSequenceShadowPixelCopy.onRequest = {
-                h.fx.sut.onDrawCallback(h.hookLayout, h.status.drawState)
-            }
-
-            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
-
-            assertEquals(0, h.fake.captures)
-        } finally {
-            DrawSequenceShadowPixelCopy.onRequest = null
-            h.fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
-    fun `legacy animation redraw heuristic remains active when verification is disabled`() {
-        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
-        try {
-            DrawSequenceShadowPixelCopy.onRequest = {
-                h.hookLayout.setHasTransientState(true)
-                h.fx.sut.onDrawCallback(h.hookLayout, h.status.drawState)
-            }
-
-            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
-
-            assertEquals(1, h.fake.captures)
-        } finally {
-            h.hookLayout.setHasTransientState(false)
-            DrawSequenceShadowPixelCopy.onRequest = null
-            h.fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
-    fun `legacy capture stays pinned when verification is enabled mid-capture`() {
-        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
-        try {
-            DrawSequenceShadowPixelCopy.onRequest = {
-                h.fx.config.sessionReplayConfig.verifyScreenshotMaskAlignment = true
-                h.hookLayout.setHasTransientState(true)
-                h.fx.sut.onDrawCallback(h.hookLayout, h.status.drawState)
-            }
-
-            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
-
-            assertEquals(1, h.fake.captures)
-        } finally {
-            h.hookLayout.setHasTransientState(false)
-            DrawSequenceShadowPixelCopy.onRequest = null
-            h.fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
-    fun `verified capture stays pinned when verification is disabled mid-capture`() {
-        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = true)
-        try {
-            DrawSequenceShadowPixelCopy.onRequest = {
-                h.fx.config.sessionReplayConfig.verifyScreenshotMaskAlignment = false
-                h.fx.sut.onDrawCallback(h.hookLayout, h.status.drawState)
-            }
-
-            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
-
-            assertEquals(1, h.fake.captures)
-        } finally {
-            DrawSequenceShadowPixelCopy.onRequest = null
-            h.fx.sut.uninstall()
-        }
-    }
-
-    @Test
-    @Config(sdk = [26], shadows = [DrawSequenceShadowPixelCopy::class])
     fun `a draw whose sample loses the race to setBaseline still forces a fresh pre-walk`() {
         // recordDraw fires mid-pre-walk but the sample never lands before the baseline is
         // fixed (the beginDrawSample lock race). The draw counter must still catch it, so
@@ -4094,6 +3771,239 @@ internal class PostHogReplayIntegrationTest {
         } finally {
             h.fx.sut.uninstall()
         }
+    }
+
+    // ---- GAME-1402: the screenshot can never ship a masked view unmasked ----
+    //
+    // PixelCopy freezes the frame that was last DRAWN; the view tree can already be ahead of it
+    // (a masked view hidden or faded since that draw, or moved by a layout whose draw an
+    // OnPreDrawListener cancelled). The old unverified path walked that newer tree after the
+    // copy and painted its masks onto the older pixels. Each test below freezes a frame with the
+    // masked view's pixels in it (RED), moves the tree on before the masks are painted, and
+    // requires that the shipped frame is either discarded or still masked where the view WAS.
+    // Verification is requested OFF in each one: the fork ignores the flag.
+
+    private fun captureRedFrameThen(
+        h: ScreenshotCaptureHarness,
+        afterCopy: () -> Unit,
+    ): Rect {
+        h.hookLayout.layout(0, 0, 300, 300)
+        h.child.layout(40, 40, 140, 140)
+        val drawnAt = Rect()
+        assertTrue(h.child.getGlobalVisibleRect(drawnAt))
+        RecordingShadowPixelCopy.reset()
+        RecordingShadowPixelCopy.onRequest = { bitmap ->
+            // The copied frame: the masked view's pixels, drawn where it was at the last draw.
+            bitmap.eraseColor(Color.RED)
+            afterCopy()
+        }
+        h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
+        return drawnAt
+    }
+
+    private fun assertNoShippedFrameShowsRedAt(
+        h: ScreenshotCaptureHarness,
+        drawnAt: Rect,
+    ) {
+        if (h.fake.captures == 0) return // discarded: nothing left the device
+        @Suppress("UNCHECKED_CAST")
+        val events = h.fake.properties?.get("\$snapshot_data") as List<RREvent>
+        val full = events.first { it.type == RREventType.FullSnapshot }
+        val wireframe = ((full.data as Map<*, *>)["wireframes"] as List<*>).single() as RRWireframe
+        val bytes = Base64.decode(assertNotNull(wireframe.base64).substringAfter(','), Base64.DEFAULT)
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        try {
+            val sx = bitmap.width / 300f
+            val sy = bitmap.height / 300f
+            for (y in drawnAt.top + 5 until drawnAt.bottom - 5 step 10) {
+                for (x in drawnAt.left + 5 until drawnAt.right - 5 step 10) {
+                    val px = bitmap.getPixel((x * sx).toInt(), (y * sy).toInt())
+                    val red = Color.red(px) > 200 && Color.green(px) < 60 && Color.blue(px) < 60
+                    assertFalse(red, "masked view's pixels shipped unmasked at ($x,$y): #${Integer.toHexString(px)}")
+                }
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view hidden after the last draw never ships unmasked`() {
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            val drawnAt = captureRedFrameThen(h) { h.child.visibility = View.INVISIBLE }
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view faded to alpha 0 after the last draw never ships unmasked`() {
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            val drawnAt = captureRedFrameThen(h) { h.child.alpha = 0f }
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view moved by a layout whose draw was cancelled never ships unmasked`() {
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            // A layout with no draw after it: what an OnPreDrawListener returning false leaves.
+            val drawnAt = captureRedFrameThen(h) { h.child.layout(40, 160, 140, 260) }
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view shrunk to zero size after the last draw never ships unmasked`() {
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            val drawnAt = captureRedFrameThen(h) { h.child.layout(40, 40, 40, 40) }
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `an unchanged masked view is still masked and the frame kept`() {
+        // Control for the four above: with nothing moving, the frame ships, masked.
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            val drawnAt = captureRedFrameThen(h) {}
+            assertEquals(1, h.fake.captures)
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun `a masked view moved by a layout whose draw was cancelled before the capture never ships unmasked`() {
+        // The editor's OnPreDrawListeners (ChromeBottomStack, ChromeRowD2, LabelFit) return
+        // false after re-fitting something: layout has moved the photo, the screen still shows
+        // it where it was, and the next capture starts from that tree.
+        val h = screenshotCaptureHarness(enableMaskAlignmentVerification = false)
+        try {
+            h.status.drawState.recordDraw() // the frame on screen: child at (40,40)-(140,140)
+            val drawnAt =
+                captureRedFrameThen(h) {}.also {
+                    assertEquals(1, h.fake.captures) // control: unchanged tree, frame kept
+                }
+            h.child.layout(40, 160, 140, 260)
+            h.status.drawState.recordLayout() // OnGlobalLayout ran; the draw was cancelled
+            val capturesBefore = h.fake.captures
+            RecordingShadowPixelCopy.onRequest = { it.eraseColor(Color.RED) }
+            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
+            assertEquals(capturesBefore, h.fake.captures)
+            assertNoShippedFrameShowsRedAt(h, drawnAt)
+
+            h.status.drawState.recordDraw() // the moved tree reaches the screen
+            h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window))
+            assertEquals(capturesBefore + 1, h.fake.captures)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    @Config(sdk = [28], shadows = [RecordingShadowPixelCopy::class])
+    fun `a capture is skipped while the view tree has changes no draw has rendered`() {
+        val h = screenshotCaptureHarness()
+        h.fx.sut.undrawnChangesOverride = null // the real check
+        try {
+            RecordingShadowPixelCopy.reset()
+
+            fun drawTree() = h.hookLayout.draw(Canvas(Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)))
+
+            drawTree()
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(1, RecordingShadowPixelCopy.requests.size)
+
+            // Hidden since the last draw: the screen still shows it, the tree says it is gone.
+            h.child.visibility = View.INVISIBLE
+            assertFalse(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(1, RecordingShadowPixelCopy.requests.size) // never copied
+
+            drawTree()
+            assertTrue(h.fx.sut.generateSnapshot(WeakReference(h.hookLayout), WeakReference(h.window)))
+            assertEquals(2, RecordingShadowPixelCopy.requests.size)
+        } finally {
+            h.fx.sut.uninstall()
+            RecordingShadowPixelCopy.reset()
+        }
+    }
+
+    @Test
+    fun `a mask walk over a window that is not showing is poisoned`() {
+        val h = screenshotCaptureHarness()
+        try {
+            val visibleWalk = PostHogReplayIntegration.MaskWalk()
+            h.fx.sut.findWindowMasks(h.hookLayout, visibleWalk)
+            assertFalse(visibleWalk.poisoned)
+            assertEquals(1, visibleWalk.rects.size)
+
+            // An activity being stopped: every view now reads as invisible, so an ordinary walk
+            // would return no masks while the window's last frame can still be copied.
+            setWindowVisibility(h.hookLayout, View.GONE)
+            val hiddenWalk = PostHogReplayIntegration.MaskWalk()
+            h.fx.sut.findWindowMasks(h.hookLayout, hiddenWalk)
+            assertTrue(hiddenWalk.poisoned)
+        } finally {
+            h.fx.sut.uninstall()
+        }
+    }
+
+    @Test
+    fun `a masked walk root whose geometry is unknowable poisons the walk`() {
+        val h = screenshotCaptureHarness()
+        try {
+            h.child.setHasTransientState(true)
+            val walk = PostHogReplayIntegration.MaskWalk()
+            h.fx.sut.findMaskableWidgets(h.child, walk)
+            assertTrue(walk.poisoned)
+        } finally {
+            h.child.setHasTransientState(false)
+            h.fx.sut.uninstall()
+        }
+    }
+
+    private fun setWindowVisibility(
+        view: View,
+        visibility: Int,
+    ) {
+        val attachInfo =
+            View::class.java.getDeclaredField("mAttachInfo")
+                .apply { isAccessible = true }
+                .get(view)
+        attachInfo.javaClass.getDeclaredField("mWindowVisibility")
+            .apply { isAccessible = true }
+            .setInt(attachInfo, visibility)
     }
 
     @Test

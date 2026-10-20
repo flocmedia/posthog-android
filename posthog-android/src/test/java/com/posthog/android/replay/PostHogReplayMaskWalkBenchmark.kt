@@ -47,7 +47,7 @@ internal class PostHogReplayMaskWalkBenchmark {
                 sessionReplayConfig.screenshot = true
                 sessionReplayConfig.verifyScreenshotMaskAlignment = true
             }
-        sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler())
+        sut = PostHogReplayIntegration(ApplicationProvider.getApplicationContext(), config, MainHandler()).robolectricDrawn()
         activity = Robolectric.buildActivity(Activity::class.java).setup().get()
         shadowOf(android.os.Looper.getMainLooper()).idle()
         makeWindowVisible(activity.window.decorView)
