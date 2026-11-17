@@ -8,6 +8,7 @@ import com.posthog.internal.interruptSafely
 import com.posthog.internal.replay.RRPluginEvent
 import com.posthog.internal.replay.capture
 import java.util.concurrent.atomic.AtomicBoolean
+import android.os.Process as AndroidProcess
 
 internal class PostHogLogCatIntegration(private val config: PostHogAndroidConfig) : PostHogIntegration {
     @Volatile
@@ -36,7 +37,10 @@ internal class PostHogLogCatIntegration(private val config: PostHogAndroidConfig
             return
         }
         ownsInstallation = true
-        val cmd = logcatCommand(config.dateProvider.currentTimeMillis())
+        // Own process only. On a shared log view (e.g. Huawei + GBox) an unfiltered
+        // read returned other apps' lines, OAuth tokens and account emails included.
+        val ownPid = AndroidProcess.myPid()
+        val cmd = logcatCommand(config.dateProvider.currentTimeMillis(), ownPid)
         val logcatParser = LogcatParser()
 
         logcatInProgress = false
@@ -58,25 +62,9 @@ internal class PostHogLogCatIntegration(private val config: PostHogAndroidConfig
                                     continue
                                 }
 
-                                if (line.isNullOrEmpty()) {
-                                    continue
-                                }
-                                // TODO: filter out all non useful stuff
-                                if (line.contains("PostHog") || line.contains("StrictMode")) {
-                                    continue
-                                } else {
-                                    val log = logcatParser.parse(line) ?: continue
-
-                                    val props = mutableMapOf<String, Any>()
-                                    props["level"] = log.level.toString()
-                                    val tag = log.tag?.trim() ?: ""
-                                    val content = log.text?.trim() ?: ""
-                                    props["payload"] = listOf("$tag: $content")
-                                    val time = log.time?.time?.time ?: config.dateProvider.currentTimeMillis()
-                                    val event = RRPluginEvent("rrweb/console@1", props, time)
-                                    // TODO: batch events
-                                    listOf(event).capture(postHog)
-                                }
+                                val event = consoleEventFor(line, logcatParser, ownPid) ?: continue
+                                // TODO: batch events
+                                listOf(event).capture(postHog)
                             } catch (e: Throwable) {
                                 // ignore
                             }
@@ -107,16 +95,60 @@ internal class PostHogLogCatIntegration(private val config: PostHogAndroidConfig
     @PostHogVisibleForTesting
     internal fun isInstalled(): Boolean = integrationInstalled.get()
 
+    /**
+     * `--pid` (API 24+) asks logcat for our own lines only. It is a request, not a
+     * guarantee: some log views (e.g. GBox on Huawei) ignore it, so [consoleEventFor]
+     * also checks the pid column of every line.
+     */
     @PostHogVisibleForTesting
-    internal fun logcatCommand(timestampMillis: Long): MutableList<String> =
+    internal fun logcatCommand(
+        timestampMillis: Long,
+        ownPid: Int,
+    ): MutableList<String> =
         mutableListOf(
             "logcat",
+            "--pid=$ownPid",
             "-v",
             "epoch",
             "-T",
             "${timestampMillis / 1000}.${(timestampMillis % 1000).toString().padStart(3, '0')}",
             "*:E",
         )
+
+    /**
+     * Turns one logcat line into a console event, or returns null to drop it.
+     *
+     * Fails closed: a line is kept only when it parses as `-v epoch` output AND its pid
+     * column is [ownPid]. Lines from other processes, lines in any other format
+     * (threadtime, brief, ...) and lines that do not parse are all dropped, because
+     * their pid cannot be checked.
+     */
+    @PostHogVisibleForTesting
+    internal fun consoleEventFor(
+        line: String?,
+        parser: LogcatParser,
+        ownPid: Int,
+    ): RRPluginEvent? {
+        if (line.isNullOrEmpty()) {
+            return null
+        }
+        // TODO: filter out all non useful stuff
+        if (line.contains("PostHog") || line.contains("StrictMode")) {
+            return null
+        }
+        val log = parser.parse(line) ?: return null
+        if (log.pid != ownPid) {
+            return null
+        }
+
+        val props = mutableMapOf<String, Any>()
+        props["level"] = log.level.toString()
+        val tag = log.tag?.trim() ?: ""
+        val content = log.text?.trim() ?: ""
+        props["payload"] = listOf("$tag: $content")
+        val time = log.time?.time?.time ?: config.dateProvider.currentTimeMillis()
+        return RRPluginEvent("rrweb/console@1", props, time)
+    }
 
     @Synchronized
     override fun uninstall() {

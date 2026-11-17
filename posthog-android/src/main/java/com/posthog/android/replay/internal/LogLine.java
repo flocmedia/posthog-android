@@ -22,6 +22,11 @@ public class LogLine {
     public String level;
 
     /**
+     * The pid column of the line: the process that wrote it. -1 when unknown.
+     */
+    public int pid = -1;
+
+    /**
      * The log tag.
      */
     public String tag;

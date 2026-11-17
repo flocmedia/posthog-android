@@ -44,4 +44,22 @@ internal class LogcatParserTest {
 
         assertNull(log)
     }
+
+    @Test
+    fun `parses the pid column of an epoch line`() {
+        val log = LogcatParser().parse("1721057445.123  4321  4400 E MyTag: message")
+
+        assertNotNull(log)
+        assertEquals(4321, log.pid)
+    }
+
+    @Test
+    fun `rejects brief lines, whose pid cannot be read by the epoch pattern`() {
+        assertNull(LogcatParser().parse("E/MyTag( 4321): message"))
+    }
+
+    @Test
+    fun `rejects a pid column too large for an int instead of guessing`() {
+        assertNull(LogcatParser().parse("1721057445.123  99999999999999  4400 E MyTag: message"))
+    }
 }
