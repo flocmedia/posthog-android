@@ -13,7 +13,12 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
+
+private const val OWN_PID = 1234
+private const val OTHER_PID = 5678
 
 @RunWith(AndroidJUnit4::class)
 @Config(sdk = [26])
@@ -43,9 +48,85 @@ internal class PostHogLogCatIntegrationTest {
     fun `logcat command requests epoch output and an epoch start time`() {
         val sut = getSut(createConfig())
 
-        val command = sut.logcatCommand(1721057445123L)
+        val command = sut.logcatCommand(1721057445123L, OWN_PID)
 
-        assertEquals(listOf("logcat", "-v", "epoch", "-T", "1721057445.123", "*:E"), command)
+        assertEquals(listOf("logcat", "--pid=$OWN_PID", "-v", "epoch", "-T", "1721057445.123", "*:E"), command)
+    }
+
+    // GAME-1703: on a shared log view (Huawei + GBox) other apps' lines, with OAuth
+    // tokens and account emails in them, were captured into recordings.
+
+    @Test
+    fun `keeps an epoch line written by our own pid`() {
+        val sut = getSut(createConfig())
+
+        val event = sut.consoleEventFor("1721057445.123  $OWN_PID  4400 E MyTag: own line", LogcatParser(), OWN_PID)
+
+        assertNotNull(event)
+        val data = event.data as Map<*, *>
+        assertEquals("rrweb/console@1", data["plugin"])
+        val payload = data["payload"] as Map<*, *>
+        assertEquals(listOf("MyTag: own line"), payload["payload"])
+        assertEquals("error", payload["level"])
+    }
+
+    @Test
+    fun `drops an epoch line written by another pid`() {
+        val sut = getSut(createConfig())
+
+        val event = sut.consoleEventFor("1721057445.123  $OTHER_PID  4400 E Finsky: foreign line", LogcatParser(), OWN_PID)
+
+        assertNull(event)
+    }
+
+    @Test
+    fun `drops a foreign line whose tid equals our pid`() {
+        val sut = getSut(createConfig())
+
+        val event = sut.consoleEventFor("1721057445.123  $OTHER_PID  $OWN_PID E Finsky: foreign line", LogcatParser(), OWN_PID)
+
+        assertNull(event)
+    }
+
+    @Test
+    fun `drops a foreign line whose message mentions our pid`() {
+        val sut = getSut(createConfig())
+
+        val event =
+            sut.consoleEventFor(
+                "1721057445.123  $OTHER_PID  4400 E Finsky: pid $OWN_PID  $OWN_PID E x: y",
+                LogcatParser(),
+                OWN_PID,
+            )
+
+        assertNull(event)
+    }
+
+    @Test
+    fun `drops lines whose pid cannot be checked (fail closed)`() {
+        val sut = getSut(createConfig())
+        val malformed =
+            listOf(
+                // threadtime: our pid, but not the format the command asks for
+                "12-31 23:59:59.987  $OWN_PID  4400 E MyTag: threadtime line",
+                // brief
+                "E/MyTag( $OWN_PID): brief line",
+                // no pid column
+                "1721057445.123 E MyTag: no pid",
+                // non-numeric pid
+                "1721057445.123  abc  4400 E MyTag: bad pid",
+                // pid overflows an int
+                "1721057445.123  99999999999999  4400 E MyTag: overflow",
+                // free text continuation
+                "    at com.example.Foo.bar(Foo.kt:12)",
+                "--------- beginning of main",
+                "",
+            )
+
+        for (line in malformed) {
+            assertNull(sut.consoleEventFor(line, LogcatParser(), OWN_PID), "kept: $line")
+        }
+        assertNull(sut.consoleEventFor(null, LogcatParser(), OWN_PID))
     }
 
     @Test

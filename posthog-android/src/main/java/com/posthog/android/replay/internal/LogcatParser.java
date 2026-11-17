@@ -47,6 +47,7 @@ public class LogcatParser {
                 final LogLine ll = new LogLine();
 
                 ll.time = parseEpochCalendar(m);
+                ll.pid = Integer.parseInt(m.group(3));
                 char level = m.group(5).charAt(0);
 
                 switch (level) {
